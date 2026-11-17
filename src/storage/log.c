@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -18,6 +19,7 @@
 #define RECORD_BODY_FIXED 28
 #define INITIAL_SEGMENTS 4
 #define INITIAL_INDEX 1024
+#define HWM_FILE "hwm.checkpoint"
 
 #ifdef SIN_PROTECCION
 #define APPEND_LOCK(log) ((void)(log))
@@ -225,7 +227,7 @@ static int validate(const message_t *msgs, size_t n, size_t *total)
     return 0;
 }
 
-static int segment_add_locked(partition_log_t *log, int64_t base)
+static int segment_add_locked(partition_log_t *log, int64_t base, bool existing)
 {
     if (log->nsegs == log->segs_cap) {
         size_t cap = log->segs_cap * 2;
@@ -241,14 +243,20 @@ static int segment_add_locked(partition_log_t *log, int64_t base)
     if (len < 0 || (size_t)len >= sizeof path) {
         return -1;
     }
-    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+    int flags = O_RDWR;
+    if (!existing) {
+        flags |= O_CREAT | O_EXCL;
+    }
+    int fd = open(path, flags, 0644);
     if (fd < 0) {
         return -1;
     }
     uint64_t *pos = malloc(INITIAL_INDEX * sizeof *pos);
     if (pos == NULL) {
         close(fd);
-        unlink(path);
+        if (!existing) {
+            unlink(path);
+        }
         return -1;
     }
     segment_t *seg = &log->segs[log->nsegs];
@@ -319,23 +327,224 @@ static void leave(partition_log_t *log)
     pthread_mutex_unlock(&log->mutex);
 }
 
-static int scan_for_segments(const char *dir)
+static int64_t parse_segment_name(const char *name)
+{
+    if (strlen(name) != 24 || strcmp(name + 20, ".log") != 0) {
+        return -1;
+    }
+    int64_t base = 0;
+    for (int i = 0; i < 20; i++) {
+        if (name[i] < '0' || name[i] > '9') {
+            return -1;
+        }
+        int digit = name[i] - '0';
+        if (base > (INT64_MAX - digit) / 10) {
+            return -1;
+        }
+        base = base * 10 + digit;
+    }
+    return base;
+}
+
+static int compare_bases(const void *a, const void *b)
+{
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+    if (x < y) {
+        return -1;
+    }
+    if (x > y) {
+        return 1;
+    }
+    return 0;
+}
+
+static int list_segments(const char *dir, int64_t **bases, size_t *n)
 {
     DIR *d = opendir(dir);
     if (d == NULL) {
         return -1;
     }
-    int found = 0;
+    int64_t *list = NULL;
+    size_t count = 0;
+    size_t cap = 0;
     struct dirent *e = readdir(d);
-    while (e != NULL && found == 0) {
-        size_t len = strlen(e->d_name);
-        if (len > 4 && strcmp(e->d_name + len - 4, ".log") == 0) {
-            found = 1;
+    while (e != NULL) {
+        int64_t base = parse_segment_name(e->d_name);
+        if (base >= 0) {
+            if (count == cap) {
+                size_t new_cap = 8;
+                if (cap > 0) {
+                    new_cap = cap * 2;
+                }
+                int64_t *grown = realloc(list, new_cap * sizeof *grown);
+                if (grown == NULL) {
+                    free(list);
+                    closedir(d);
+                    return -1;
+                }
+                list = grown;
+                cap = new_cap;
+            }
+            list[count] = base;
+            count++;
         }
         e = readdir(d);
     }
     closedir(d);
-    return found;
+    if (count > 1) {
+        qsort(list, count, sizeof *list, compare_bases);
+    }
+    *bases = list;
+    *n = count;
+    return 0;
+}
+
+static bool record_valid(int fd, uint8_t *buf, uint64_t pos, uint64_t remaining,
+                         int64_t expected, size_t *used)
+{
+    if (remaining < RECORD_HEADER_BYTES || read_full(fd, buf, 4, pos) != 0) {
+        return false;
+    }
+    uint32_t length = get_u32(buf);
+    if (length < RECORD_BODY_FIXED || length > PLOG_MAX_MESSAGE_BYTES + RECORD_BODY_FIXED) {
+        return false;
+    }
+    size_t total = 4 + (size_t)length;
+    if (total > remaining || read_full(fd, buf, total, pos) != 0) {
+        return false;
+    }
+    message_t m;
+    if (decode_record(buf, total, &m, used) != 0) {
+        return false;
+    }
+    return m.offset == expected;
+}
+
+static int segment_scan(segment_t *seg, bool last)
+{
+    struct stat st;
+    if (fstat(seg->fd, &st) != 0) {
+        return -1;
+    }
+    uint64_t file_size = (uint64_t)st.st_size;
+    uint8_t *buf = malloc(PLOG_MAX_MESSAGE_BYTES + RECORD_HEADER_BYTES);
+    if (buf == NULL) {
+        return -1;
+    }
+    uint64_t pos = 0;
+    int rc = 0;
+    bool valid = true;
+    while (valid && pos < file_size) {
+        size_t used = 0;
+        valid = record_valid(seg->fd, buf, pos, file_size - pos, seg->base_offset + seg->count,
+                             &used);
+        if (valid) {
+            if (index_reserve(seg, 1) != 0) {
+                rc = -1;
+                break;
+            }
+            seg->pos[seg->count] = pos;
+            seg->count++;
+            pos += used;
+        }
+    }
+    free(buf);
+    seg->size = pos;
+    if (rc == 0 && pos < file_size) {
+        if (!last) {
+            errno = EIO;
+            rc = -1;
+        } else if (ftruncate(seg->fd, (off_t)pos) != 0 || fsync(seg->fd) != 0) {
+            rc = -1;
+        }
+    }
+    return rc;
+}
+
+static int recover_segments(partition_log_t *log, const int64_t *bases, size_t n)
+{
+    if (n == 0) {
+        return segment_add_locked(log, 0, false);
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (i > 0) {
+            const segment_t *prev = &log->segs[i - 1];
+            if (bases[i] != prev->base_offset + prev->count) {
+                errno = EIO;
+                return -1;
+            }
+        }
+        if (segment_add_locked(log, bases[i], true) != 0) {
+            return -1;
+        }
+        if (segment_scan(&log->segs[i], i == n - 1) != 0) {
+            return -1;
+        }
+    }
+    const segment_t *last = &log->segs[n - 1];
+    log->leo = last->base_offset + last->count;
+    return 0;
+}
+
+static int hwm_save(const char *dir, int64_t hwm)
+{
+    char path[PATH_MAX + 32];
+    char tmp[PATH_MAX + 32];
+    int a = snprintf(path, sizeof path, "%s/%s", dir, HWM_FILE);
+    int b = snprintf(tmp, sizeof tmp, "%s/%s.tmp", dir, HWM_FILE);
+    if (a < 0 || b < 0 || (size_t)a >= sizeof path || (size_t)b >= sizeof tmp) {
+        return -1;
+    }
+    char text[32];
+    int len = snprintf(text, sizeof text, "%lld\n", (long long)hwm);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+    int rc = 0;
+    if (write_full(fd, (const uint8_t *)text, (size_t)len, 0) != 0 || fsync(fd) != 0) {
+        rc = -1;
+    }
+    close(fd);
+    if (rc == 0 && rename(tmp, path) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
+
+static int64_t hwm_load(const char *dir)
+{
+    char path[PATH_MAX + 32];
+    int len = snprintf(path, sizeof path, "%s/%s", dir, HWM_FILE);
+    if (len < 0 || (size_t)len >= sizeof path) {
+        return 0;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+    char text[32];
+    ssize_t got = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (got <= 0) {
+        return 0;
+    }
+    text[got] = '\0';
+    return (int64_t)strtoll(text, NULL, 10);
+}
+
+static void log_free(partition_log_t *log)
+{
+    for (size_t i = 0; i < log->nsegs; i++) {
+        close(log->segs[i].fd);
+        free(log->segs[i].pos);
+    }
+    free(log->segs);
+    pthread_mutex_destroy(&log->mutex);
+    pthread_cond_destroy(&log->changed);
+    pthread_cond_destroy(&log->idle);
+    free(log);
 }
 
 partition_log_t *plog_open(const char *dir, uint64_t retention_bytes)
@@ -349,19 +558,19 @@ partition_log_t *plog_open_ex(const char *dir, uint64_t retention_bytes, uint64_
     if (fs_mkdir_p(dir) != 0) {
         return NULL;
     }
-    int scan = scan_for_segments(dir);
-    if (scan != 0) {
-        if (scan > 0) {
-            errno = EEXIST;
-        }
+    int64_t *bases = NULL;
+    size_t nbases = 0;
+    if (list_segments(dir, &bases, &nbases) != 0) {
         return NULL;
     }
     partition_log_t *log = calloc(1, sizeof *log);
     if (log == NULL) {
+        free(bases);
         return NULL;
     }
     int len = snprintf(log->dir, sizeof log->dir, "%s", dir);
     if (len < 0 || (size_t)len >= sizeof log->dir) {
+        free(bases);
         free(log);
         return NULL;
     }
@@ -370,17 +579,6 @@ partition_log_t *plog_open_ex(const char *dir, uint64_t retention_bytes, uint64_
     if (log->segment_bytes == 0) {
         log->segment_bytes = PLOG_DEFAULT_SEGMENT_BYTES;
     }
-    log->segs = malloc(INITIAL_SEGMENTS * sizeof *log->segs);
-    if (log->segs == NULL) {
-        free(log);
-        return NULL;
-    }
-    log->segs_cap = INITIAL_SEGMENTS;
-    if (segment_add_locked(log, 0) != 0) {
-        free(log->segs);
-        free(log);
-        return NULL;
-    }
     pthread_condattr_t attr;
     pthread_condattr_init(&attr);
     pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
@@ -388,6 +586,27 @@ partition_log_t *plog_open_ex(const char *dir, uint64_t retention_bytes, uint64_
     pthread_cond_init(&log->changed, &attr);
     pthread_cond_init(&log->idle, NULL);
     pthread_condattr_destroy(&attr);
+    log->segs = malloc(INITIAL_SEGMENTS * sizeof *log->segs);
+    if (log->segs == NULL) {
+        free(bases);
+        log_free(log);
+        return NULL;
+    }
+    log->segs_cap = INITIAL_SEGMENTS;
+    int rc = recover_segments(log, bases, nbases);
+    free(bases);
+    if (rc != 0) {
+        log_free(log);
+        return NULL;
+    }
+    int64_t hwm = hwm_load(log->dir);
+    if (hwm > log->leo) {
+        hwm = log->leo;
+    }
+    if (hwm < log->segs[0].base_offset) {
+        hwm = log->segs[0].base_offset;
+    }
+    log->hwm = hwm;
     return log;
 }
 
@@ -406,7 +625,7 @@ static int append_batch(partition_log_t *log, const message_t *msgs, size_t n, b
     int rc = -1;
     segment_t *active = NULL;
 
-    pthread_mutex_lock(&log->mutex);
+    APPEND_LOCK(log);
     if (log->closed) {
         rc = MB_ERR_SHUTTING_DOWN;
         goto out;
@@ -421,7 +640,7 @@ static int append_batch(partition_log_t *log, const message_t *msgs, size_t n, b
     }
     active = &log->segs[log->nsegs - 1];
     if (active->count > 0 && active->size + total > log->segment_bytes) {
-        if (fsync(active->fd) != 0 || segment_add_locked(log, log->leo) != 0) {
+        if (fsync(active->fd) != 0 || segment_add_locked(log, log->leo, false) != 0) {
             goto out;
         }
         active = &log->segs[log->nsegs - 1];
@@ -455,7 +674,7 @@ static int append_batch(partition_log_t *log, const message_t *msgs, size_t n, b
     pthread_cond_broadcast(&log->changed);
     rc = MB_OK;
 out:
-    pthread_mutex_unlock(&log->mutex);
+    APPEND_UNLOCK(log);
     free(buf);
     return rc;
 }
@@ -638,10 +857,11 @@ int plog_flush(partition_log_t *log)
         return MB_ERR_SHUTTING_DOWN;
     }
     int fd = log->segs[log->nsegs - 1].fd;
+    int64_t hwm = log->hwm;
     log->users++;
     pthread_mutex_unlock(&log->mutex);
     int rc = MB_OK;
-    if (fsync(fd) != 0) {
+    if (fsync(fd) != 0 || hwm_save(log->dir, hwm) != 0) {
         rc = -1;
     }
     leave(log);
@@ -662,13 +882,6 @@ void plog_close(partition_log_t *log)
     pthread_mutex_unlock(&log->mutex);
 
     fsync(log->segs[log->nsegs - 1].fd);
-    for (size_t i = 0; i < log->nsegs; i++) {
-        close(log->segs[i].fd);
-        free(log->segs[i].pos);
-    }
-    free(log->segs);
-    pthread_mutex_destroy(&log->mutex);
-    pthread_cond_destroy(&log->changed);
-    pthread_cond_destroy(&log->idle);
-    free(log);
+    hwm_save(log->dir, log->hwm);
+    log_free(log);
 }
