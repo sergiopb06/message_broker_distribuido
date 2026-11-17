@@ -13,7 +13,8 @@ typedef enum {
     MB_ERR_OFFSET_OUT_OF_RANGE,
     MB_ERR_REBALANCE,
     MB_ERR_TIMEOUT,
-    MB_ERR_SHUTTING_DOWN
+    MB_ERR_SHUTTING_DOWN,
+    MB_ERR_INVALID_ARGUMENT
 } mb_status_t;
 
 typedef struct {
