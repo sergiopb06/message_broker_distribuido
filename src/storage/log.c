@@ -19,6 +19,14 @@
 #define INITIAL_SEGMENTS 4
 #define INITIAL_INDEX 1024
 
+#ifdef SIN_PROTECCION
+#define APPEND_LOCK(log) ((void)(log))
+#define APPEND_UNLOCK(log) ((void)(log))
+#else
+#define APPEND_LOCK(log) pthread_mutex_lock(&(log)->mutex)
+#define APPEND_UNLOCK(log) pthread_mutex_unlock(&(log)->mutex)
+#endif
+
 typedef struct {
     int64_t base_offset;
     int fd;
