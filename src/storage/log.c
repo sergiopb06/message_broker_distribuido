@@ -547,6 +547,44 @@ static void log_free(partition_log_t *log)
     free(log);
 }
 
+// Drops whole segments, oldest first, while the partition is above retention_bytes.
+// Never drops the active segment or data at or above the high watermark.
+// Readers hold their own dup() of the descriptor, so a dropped file stays readable for them.
+static void apply_retention_locked(partition_log_t *log)
+{
+    if (log->retention_bytes == 0) {
+        return;
+    }
+    uint64_t total = 0;
+    for (size_t i = 0; i < log->nsegs; i++) {
+        total += log->segs[i].size;
+    }
+    size_t drop = 0;
+    while (drop + 1 < log->nsegs && total > log->retention_bytes
+           && log->segs[drop + 1].base_offset <= log->hwm) {
+        total -= log->segs[drop].size;
+        drop++;
+    }
+    for (size_t i = 0; i < drop; i++) {
+        char path[PATH_MAX + 32];
+        int len = snprintf(path, sizeof path, "%s/%020lld.log", log->dir,
+                           (long long)log->segs[i].base_offset);
+        if (len < 0 || (size_t)len >= sizeof path || (unlink(path) != 0 && errno != ENOENT)) {
+            drop = i;
+            break;
+        }
+    }
+    if (drop == 0) {
+        return;
+    }
+    for (size_t i = 0; i < drop; i++) {
+        close(log->segs[i].fd);
+        free(log->segs[i].pos);
+    }
+    memmove(log->segs, log->segs + drop, (log->nsegs - drop) * sizeof *log->segs);
+    log->nsegs -= drop;
+}
+
 partition_log_t *plog_open(const char *dir, uint64_t retention_bytes)
 {
     return plog_open_ex(dir, retention_bytes, PLOG_DEFAULT_SEGMENT_BYTES);
@@ -607,6 +645,7 @@ partition_log_t *plog_open_ex(const char *dir, uint64_t retention_bytes, uint64_
         hwm = log->segs[0].base_offset;
     }
     log->hwm = hwm;
+    apply_retention_locked(log);
     return log;
 }
 
@@ -671,6 +710,7 @@ static int append_batch(partition_log_t *log, const message_t *msgs, size_t n, b
         *base_offset = log->leo;
     }
     log->leo += (int64_t)n;
+    apply_retention_locked(log);
     pthread_cond_broadcast(&log->changed);
     rc = MB_OK;
 out:
@@ -731,7 +771,11 @@ int plog_read(partition_log_t *log, int64_t from, size_t max_bytes, bool committ
         count++;
         end_pos = record_end;
     }
-    int fd = seg->fd;
+    int fd = dup(seg->fd);
+    if (fd < 0) {
+        pthread_mutex_unlock(&log->mutex);
+        return -1;
+    }
     log->users++;
     pthread_mutex_unlock(&log->mutex);
 
@@ -759,6 +803,7 @@ int plog_read(partition_log_t *log, int64_t from, size_t max_bytes, bool committ
             free(msgs);
         }
     }
+    close(fd);
     leave(log);
     return rc;
 }
@@ -844,6 +889,7 @@ void plog_set_hwm(partition_log_t *log, int64_t hwm)
     }
     if (hwm > log->hwm) {
         log->hwm = hwm;
+        apply_retention_locked(log);
         pthread_cond_broadcast(&log->changed);
     }
     pthread_mutex_unlock(&log->mutex);
@@ -856,7 +902,11 @@ int plog_flush(partition_log_t *log)
         pthread_mutex_unlock(&log->mutex);
         return MB_ERR_SHUTTING_DOWN;
     }
-    int fd = log->segs[log->nsegs - 1].fd;
+    int fd = dup(log->segs[log->nsegs - 1].fd);
+    if (fd < 0) {
+        pthread_mutex_unlock(&log->mutex);
+        return -1;
+    }
     int64_t hwm = log->hwm;
     log->users++;
     pthread_mutex_unlock(&log->mutex);
@@ -864,6 +914,7 @@ int plog_flush(partition_log_t *log)
     if (fsync(fd) != 0 || hwm_save(log->dir, hwm) != 0) {
         rc = -1;
     }
+    close(fd);
     leave(log);
     return rc;
 }
