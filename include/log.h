@@ -7,12 +7,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-
 #define PLOG_MAX_MESSAGE_BYTES (1u << 20)
 #define PLOG_DEFAULT_SEGMENT_BYTES (1ull << 26)
 
 typedef struct partition_log partition_log_t;
 
+// Reopens an existing directory: every record is validated, an incomplete tail of the last
+// segment is dropped, and a corrupt earlier segment or a gap between segments fails with EIO.
+// The high watermark is restored from a checkpoint written by plog_flush and plog_close.
 partition_log_t *plog_open(const char *dir, uint64_t retention_bytes);
 partition_log_t *plog_open_ex(const char *dir, uint64_t retention_bytes, uint64_t segment_bytes);
 
