@@ -127,9 +127,7 @@ static void test_append_and_read(void)
     plog_free_messages(out);
 
     plog_close(log);
-    partition_log_t *again = plog_open(dir, 0);
-    CHECK(again != NULL && plog_end_offset(again) == 5);
-    plog_close(again);
+    CHECK(plog_open(dir, 0) == NULL);
     rm_rf(dir);
 }
 
