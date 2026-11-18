@@ -3,6 +3,7 @@
 #include "metadata.h"
 #include "common.h"
 #include "fsutil.h"
+#include "log.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -22,6 +23,7 @@ typedef struct {
     int replication;
     uint64_t retention_bytes;
     partition_info_t *parts;
+    partition_log_t **logs; // logs[p] is NULL when this broker does not keep partition p
 } topic_t;
 
 typedef struct {
@@ -37,12 +39,62 @@ static struct {
     int rank;
     int size;
     char path[PATH_MAX];
+    char dir[PATH_MAX];
     table_t table;
 } g_meta = { .mutex = PTHREAD_MUTEX_INITIALIZER };
+
+static void close_logs(topic_t *t)
+{
+    if (t->logs == NULL) {
+        return;
+    }
+    for (int p = 0; p < t->partitions; p++) {
+        plog_close(t->logs[p]);
+    }
+    free(t->logs);
+    t->logs = NULL;
+}
+
+static bool keeps_partition(const partition_info_t *info, int rank)
+{
+    for (int k = 0; k < info->n_replicas; k++) {
+        if (info->replicas[k] == rank) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Partition p of topic t lives in <dir>/topics/<t>/<p>.
+static int open_logs(topic_t *t, const char *dir, int rank)
+{
+    t->logs = calloc((size_t)t->partitions, sizeof *t->logs);
+    if (t->logs == NULL) {
+        return -1;
+    }
+    for (int p = 0; p < t->partitions; p++) {
+        if (!keeps_partition(&t->parts[p], rank)) {
+            continue;
+        }
+        char path[PATH_MAX + META_NAME_MAX + 32];
+        int len = snprintf(path, sizeof path, "%s/topics/%s/%d", dir, t->name, p);
+        if (len < 0 || (size_t)len >= sizeof path) {
+            close_logs(t);
+            return -1;
+        }
+        t->logs[p] = plog_open(path, t->retention_bytes);
+        if (t->logs[p] == NULL) {
+            close_logs(t);
+            return -1;
+        }
+    }
+    return 0;
+}
 
 static void table_free(table_t *t)
 {
     for (size_t i = 0; i < t->count; i++) {
+        close_logs(&t->topics[i]);
         free(t->topics[i].parts);
     }
     free(t->topics);
@@ -315,6 +367,13 @@ int meta_init(int rank, int size, const char *data_dir)
     } else if (errno != ENOENT) {
         goto out;
     }
+    for (size_t i = 0; i < t.count; i++) {
+        if (open_logs(&t.topics[i], data_dir, rank) != 0) {
+            table_free(&t);
+            goto out;
+        }
+    }
+    snprintf(g_meta.dir, sizeof g_meta.dir, "%s", data_dir);
     g_meta.table = t;
     g_meta.rank = rank;
     g_meta.size = size;
@@ -354,7 +413,12 @@ static int create_locked(const char *name, int partitions, int replication, uint
             info->replicas[k] = (info->leader + k) % g_meta.size;
         }
     }
+    if (open_logs(&topic, g_meta.dir, g_meta.rank) != 0) {
+        free(topic.parts);
+        return -1;
+    }
     if (table_push(&g_meta.table, &topic) != 0) {
+        close_logs(&topic);
         free(topic.parts);
         return -1;
     }
@@ -362,6 +426,7 @@ static int create_locked(const char *name, int partitions, int replication, uint
     if (table_save(&g_meta.table) != 0) {
         g_meta.table.version--;
         g_meta.table.count--;
+        close_logs(&topic);
         free(topic.parts);
         return -1;
     }
@@ -436,6 +501,24 @@ int meta_get_partition(const char *topic, int partition, partition_info_t *out)
     return rc;
 }
 
+partition_log_t *meta_get_log(const char *topic, int partition)
+{
+    if (topic == NULL) {
+        return NULL;
+    }
+    pthread_mutex_lock(&g_meta.mutex);
+    partition_log_t *log = NULL;
+    const topic_t *t = NULL;
+    if (g_meta.ready) {
+        t = table_find(&g_meta.table, topic);
+    }
+    if (t != NULL && t->logs != NULL && partition >= 0 && partition < t->partitions) {
+        log = t->logs[partition];
+    }
+    pthread_mutex_unlock(&g_meta.mutex);
+    return log;
+}
+
 int meta_list(char *out, size_t size)
 {
     if (out == NULL || size == 0) {
@@ -492,6 +575,10 @@ int meta_describe(const char *topic, char *out, size_t size)
         for (int p = 0; p < t->partitions; p++) {
             fprintf(f, "  partition %d leader=%d replicas=", p, t->parts[p].leader);
             write_replicas(f, &t->parts[p]);
+            if (t->logs != NULL && t->logs[p] != NULL) {
+                fprintf(f, " hwm=%lld leo=%lld", (long long)plog_hwm(t->logs[p]),
+                        (long long)plog_end_offset(t->logs[p]));
+            }
             fputc('\n', f);
         }
         if (fclose(f) == 0) {

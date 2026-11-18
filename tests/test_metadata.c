@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define BIG (1 << 20)
@@ -296,6 +297,57 @@ static void test_concurrent_create(void)
     rm_rf(dir);
 }
 
+static bool dir_exists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void test_partition_logs(void)
+{
+    check_section("partition logs", "each broker opens the logs it keeps and they survive a restart");
+    char dir[64];
+    char path[128];
+    make_tmpdir(dir, sizeof dir);
+    CHECK(reinit(0, 3, dir) == 0);
+    CHECK(meta_get_log("pedidos", 0) == NULL);
+    CHECK(meta_create_topic("pedidos", 3, 2, 0) == MB_OK);
+
+    CHECK(meta_get_log("pedidos", 0) != NULL);
+    CHECK(meta_get_log("pedidos", 1) == NULL);
+    CHECK(meta_get_log("pedidos", 2) != NULL);
+    CHECK(meta_get_log("pedidos", 3) == NULL);
+    CHECK(meta_get_log("pedidos", -1) == NULL);
+    CHECK(meta_get_log("otro", 0) == NULL);
+    snprintf(path, sizeof path, "%s/topics/pedidos/0", dir);
+    CHECK(dir_exists(path));
+    snprintf(path, sizeof path, "%s/topics/pedidos/1", dir);
+    CHECK(!dir_exists(path));
+
+    partition_log_t *log = meta_get_log("pedidos", 2);
+    message_t msgs[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        msgs[i].value = "v";
+        msgs[i].value_len = 1;
+    }
+    int64_t base = -1;
+    CHECK(plog_append(log, msgs, 3, &base) == MB_OK && base == 0);
+    plog_set_hwm(log, 2);
+    CHECK(meta_describe("pedidos", g_text, sizeof g_text) == MB_OK);
+    CHECK(strstr(g_text, "partition 2 leader=2 replicas=2,0 hwm=2 leo=3") != NULL);
+    CHECK(strstr(g_text, "partition 1 leader=1 replicas=1,2\n") != NULL);
+
+    CHECK(reinit(0, 3, dir) == 0);
+    log = meta_get_log("pedidos", 2);
+    CHECK(log != NULL && plog_end_offset(log) == 3 && plog_hwm(log) == 2);
+
+    CHECK(reinit(1, 3, dir) == 0);
+    CHECK(meta_get_log("pedidos", 0) != NULL);
+    CHECK(meta_get_log("pedidos", 1) != NULL);
+    CHECK(meta_get_log("pedidos", 2) == NULL);
+    rm_rf(dir);
+}
+
 int main(void)
 {
     check_header("test_metadata", "cluster metadata: topics, assignment, validation and persistence");
@@ -309,6 +361,7 @@ int main(void)
     test_bad_files();
     test_truncation(dir);
     test_concurrent_create();
+    test_partition_logs();
     meta_destroy();
     rm_rf(dir);
     return check_summary("test_metadata");
