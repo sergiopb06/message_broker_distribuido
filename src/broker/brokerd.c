@@ -7,6 +7,7 @@
 #include "metadata.h"
 #include "mpi_layer.h"
 #include "replication.h"
+#include "groups.h"
 
 #include <stdatomic.h>
 #include <errno.h>
@@ -117,14 +118,17 @@ static const char *status_text(int status){
     if(status == MB_ERR_SHUTTING_DOWN)
         return "SHUTTING_DOWN";
 
+    if(status == MB_ERR_INVALID_ARGUMENT)
+        return "INVALID_ARGUMENT";
+
     return "ERROR";
 }
 
 
 
-//TOPIC LIST and TOPIC DESCRIBE: the text reply can be long.
+//TOPIC LIST, TOPIC DESCRIBE and GROUP DESCRIBE: the text reply can be long.
 //A reply that fills the buffer was probably cut
-static void reply_topic_text(int file_descriptor, const command_t *command){
+static void reply_text(int file_descriptor, const command_t *command){
     char *body = NULL;
     size_t size = REPLY_BYTES;
     int status;
@@ -143,6 +147,9 @@ static void reply_topic_text(int file_descriptor, const command_t *command){
 
         if(command->type == C_TOPIC_LIST)
             status = meta_list(body, size);
+
+        else if(command->type == C_GROUP_DESCRIBE)
+            status = group_describe(command->group, body, size);
 
         else
             status = meta_describe(command->topic, body, size);
@@ -201,7 +208,7 @@ static int choose_partition(const char *key, size_t key_len, int partitions){
 
 
 //Returns 0 to keep it open, -1 to close it
-static int server_command(int file_descriptor, const command_t *command){
+static int server_command(int file_descriptor, unsigned long member, const command_t *command){
     char *key = NULL;
     char *value = NULL;
     int result = 0;
@@ -232,8 +239,7 @@ static int server_command(int file_descriptor, const command_t *command){
 
     //TOPIC CREATE
     if(command->type == C_TOPIC_CREATE){
-        int status = meta_create_topic(command->topic, command->partitions,
-                                       command->replication, (uint64_t)command->retention_bytes);
+        int status = meta_create_topic(command->topic, command->partitions, command->replication, (uint64_t)command->retention_bytes);
 
         if(status == MB_OK)
             (void)protocol_send_response(file_descriptor, 1, "topic created");
@@ -242,9 +248,9 @@ static int server_command(int file_descriptor, const command_t *command){
             (void)protocol_send_response(file_descriptor, 0, status_text(status));
     }
 
-    //TOPIC LIST | DESCRIBE
-    else if(command->type == C_TOPIC_LIST || command->type == C_TOPIC_DESCRIBE)
-        reply_topic_text(file_descriptor, command);
+    //TOPIC LIST | TOPIC DESCRIBE | GROUP DESCRIBE
+    else if(command->type == C_TOPIC_LIST || command->type == C_TOPIC_DESCRIBE || command->type == C_GROUP_DESCRIBE)
+        reply_text(file_descriptor, command);
 
         
 
@@ -282,13 +288,72 @@ static int server_command(int file_descriptor, const command_t *command){
 
 
 
-    //NEED TO IMPLEMENT MORE CASES
+
+    //JOIN
+    else if(command->type == C_JOIN){
+        char body[REPLY_BYTES];
+        int status = group_join(command->topic, command->group, member, command->from_beginning, body, sizeof body);
+
+        if(status == MB_OK)
+            (void)protocol_send_response(file_descriptor, 1, body);
+
+        else
+            (void)protocol_send_response(file_descriptor, 0, status_text(status));
+    }
+
+
+
+    //POLL
+    else if(command->type == C_POLL){
+        char *body = NULL;
+        size_t len = 0;
+        int status = group_poll(command->topic, command->group, member, command->max_bytes, command->wait_ms, &body, &len);
+
+        if(status == MB_OK)
+            (void)protocol_send_response_bytes(file_descriptor, 1, body, len);
+
+        else
+            (void)protocol_send_response(file_descriptor, 0, status_text(status));
+
+        free(body); 
+    }
+
+
+
+    //COMMIT
+    else if(command->type == C_COMMIT){
+        int status = group_commit(command->topic, command->group, member, command->generation, command->partition, command->offset);
+
+        if(status == MB_OK)
+            (void)protocol_send_response(file_descriptor, 1, "committed");
+
+        else
+            (void)protocol_send_response(file_descriptor, 0, status_text(status));
+    }
+
+
+
+    //LEAVE
+    else if(command->type == C_LEAVE){
+        int status = group_leave(command->topic, command->group, member);
+
+        if(status == MB_OK)
+            (void)protocol_send_response(file_descriptor, 1, "left");
+
+        else
+            (void)protocol_send_response(file_descriptor, 0, status_text(status));
+    }
+
+
+
+    //NEED TO IMPLEMENT PRODUCE
 
 
     free(key);
     free(value);
     return result;
 }
+
 
 static void *handle_connection(void *arg)
 {
@@ -327,11 +392,14 @@ static void *handle_connection(void *arg)
             break;
         }
 
-        if(server_command(conn->file_descriptor, &command) < 0)
+        if(server_command(conn->file_descriptor, conn->connection_id, &command) < 0)
             break;
 
     }
 
+
+    //A consumer that disconnects without LEAVE
+    group_member_gone(conn->connection_id);
         
     if (close(conn->file_descriptor) < 0)
         perror("close(file_descriptor)");
@@ -429,7 +497,30 @@ int main(int argc, char **argv)
     }
 
 
-    //TO DO A : load topics and logs from data_directory
+    //Every broker keeps its data in its own directory: <data>/broker<rank>
+    char broker_directory[PATH_MAX];
+    int written = snprintf(broker_directory, sizeof broker_directory, "%s/broker%d", data_directory, rank);
+
+    if(written < 0 || (size_t)written >= sizeof broker_directory){
+        fprintf(stderr, "data directory path is too long\n");
+        return EXIT_FAILURE;
+    }
+
+    //Creates the directory
+    if(meta_init(rank, size, broker_directory) != 0){
+        perror("meta_init");
+        return EXIT_FAILURE;
+    }
+
+
+    //Loads the committed offsets of the groups
+    if(groups_init(broker_directory, rank, size) != 0){
+        meta_destroy();
+        return EXIT_FAILURE;
+    }
+
+
+    //TO DO A : open the partition logs of this broker
     //TO DO B : start the MPI receiver, fetch and heartbeat threads
  
 
@@ -445,6 +536,8 @@ int main(int argc, char **argv)
 
     if (listen_file_descriptor < 0)
     {
+        groups_shutdown();
+        meta_destroy();
         sem_destroy(&g_counting_sem);
         return EXIT_FAILURE;
     }
@@ -453,6 +546,7 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     unsigned long accepted = 0; 
+
 
     while (g_running)
     {                        
@@ -526,10 +620,16 @@ int main(int argc, char **argv)
         perror("close(listen_file_descriptor)");
     }
 
+
+    groups_shutdown(); 
+
+
     //wait for every handler to finish
     for(int i = 0; i < MAX_ACTIVE_THREADS; i++){
         sem_wait_retry(&g_counting_sem);
     }
+
+    meta_destroy();
 
     //TO DO B: phases 3 to 6 of the shutdown (flush, stop threads, MPI barrier, MPI_Finalize)
 
