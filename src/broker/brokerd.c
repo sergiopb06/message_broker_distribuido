@@ -38,6 +38,7 @@
 
 static volatile sig_atomic_t g_running = 1;
 static int listen_file_descriptor = -1;
+static int g_rank = 0;
 
 // Limits how many connection handlers can run at once.
 static sem_t g_counting_sem;
@@ -46,7 +47,13 @@ static sem_t g_counting_sem;
 typedef struct {
     int file_descriptor;
     unsigned long connection_id;
+    int slot; //g_connections
 } connection_t;
+
+
+//Descriptors of the active connections (-1 = free)
+static int g_connections[MAX_ACTIVE_THREADS];
+static pthread_mutex_t g_connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void on_sigint(int signum)
 {
@@ -93,6 +100,51 @@ static int install_signal_handlers(void)
 static void sem_wait_retry(sem_t *s){
     while (sem_wait(s) < 0 && errno == EINTR){}
 }
+
+
+
+static int register_connection(int file_descriptor){
+
+    int slot = -1;
+
+    pthread_mutex_lock(&g_connections_mutex);
+
+    for(int i = 0; i < MAX_ACTIVE_THREADS && slot < 0; i++){
+        if(g_connections[i] < 0){
+            g_connections[i] = file_descriptor;
+            slot = i;
+        }
+    }
+
+    pthread_mutex_unlock(&g_connections_mutex);
+    return slot;
+}
+
+
+static void unregister_connection(int slot){
+
+    if(slot < 0)
+        return;
+
+    pthread_mutex_lock(&g_connections_mutex);
+    g_connections[slot] = -1;
+    pthread_mutex_unlock(&g_connections_mutex);
+}
+
+
+
+static void wake_connections(void){
+    pthread_mutex_lock(&g_connections_mutex);
+
+    for(int i = 0; i < MAX_ACTIVE_THREADS; i++){
+        if(g_connections[i] >= 0)
+            shutdown(g_connections[i], SHUT_RD);
+    }
+
+    pthread_mutex_unlock(&g_connections_mutex);
+}
+
+
 
 
 static const char *status_text(int status){
@@ -204,6 +256,56 @@ static int choose_partition(const char *key, size_t key_len, int partitions){
 //---------------------------------------------------------------------------
 
 
+//Appends one message to a partition this broker leads and replies "<partition> <offset>".
+static void produce_message(int file_descriptor, const command_t *command, const char *key, const char *value, int partition, int replication){
+
+    partition_log_t *log = meta_get_log(command->topic, partition);
+
+    if(log == NULL){
+        (void)protocol_send_response(file_descriptor, 0, "ERROR");
+        return;
+    }
+
+
+    message_t message;
+    memset(&message, 0, sizeof message);
+    message.key_len = (uint32_t)command->key_len;
+    message.value_len = (uint32_t)command->value_len;
+    message.value = (char *)value;
+
+    if(command->key_len > 0)
+        message.key = (char *)key;
+
+    char reply[64];
+
+    //acks 0
+    if(command->acks == ACKS_NONE){
+        snprintf(reply, sizeof reply, "%d -1", partition);
+        (void)protocol_send_response(file_descriptor, 1, reply);
+    }
+
+
+    long offset;
+    int status = plog_append(log, &message, 1, &offset);
+
+    //TO DO B: with replicas the HWM moves with the fetches of the ISR and acks ALL waits for it.
+    //With replication 1 the leader is the whole ISR, so the HWM is its LEO
+
+
+    if(status == MB_OK && replication == 1)
+        plog_set_hwm(log, offset + 1);
+
+    if(command->acks == ACKS_NONE)
+        return;
+
+    if(status != MB_OK){
+        (void)protocol_send_response(file_descriptor, 0, status_text(status));
+        return;
+    }
+
+    snprintf(reply, sizeof reply, "%d %ld", partition, offset);
+    (void)protocol_send_response(file_descriptor, 1, reply);
+}
 
 
 
@@ -346,7 +448,34 @@ static int server_command(int file_descriptor, unsigned long member, const comma
 
 
 
-    //NEED TO IMPLEMENT PRODUCE
+
+    //PRODUCE
+    else if(command->type == C_PRODUCE){
+
+        topic_info_t info;
+        partition_info_t where;
+        int partition = -1;
+        int status = meta_topic_info(command->topic, &info);
+
+        if(status == MB_OK){
+            partition = choose_partition(key, command->key_len, info.partitions);
+            status = meta_get_partition(command->topic, partition, &where);
+        }
+
+        if(status != MB_OK)
+            (void)protocol_send_response(file_descriptor, 0, status_text(status));
+
+
+        else if(where.leader != g_rank){
+            char reply[64];
+            snprintf(reply, sizeof reply, "NOT_LEADER %d", where.leader);
+            (void)protocol_send_response(file_descriptor, 0, reply);
+        }
+
+
+        else
+            produce_message(file_descriptor, command, key, value, partition, info.replication);
+    }
 
 
     free(key);
@@ -400,6 +529,8 @@ static void *handle_connection(void *arg)
 
     //A consumer that disconnects without LEAVE
     group_member_gone(conn->connection_id);
+
+    unregister_connection(conn->slot);
         
     if (close(conn->file_descriptor) < 0)
         perror("close(file_descriptor)");
@@ -485,6 +616,8 @@ int main(int argc, char **argv)
     if(mpil_init(&argc, &argv, &rank, &size) < 0)
         return EXIT_FAILURE;
 
+    g_rank = rank;
+
     if(parse_args(argc, argv, &base_port, &data_directory) < 0)
         return EXIT_FAILURE;
 
@@ -520,12 +653,16 @@ int main(int argc, char **argv)
     }
 
 
-    //TO DO A : open the partition logs of this broker
     //TO DO B : start the MPI receiver, fetch and heartbeat threads
  
 
     if(install_signal_handlers() < 0)
         return EXIT_FAILURE;
+
+
+    for(int i = 0; i < MAX_ACTIVE_THREADS; i++)
+        g_connections[i] = -1;
+
 
     if(sem_init(&g_counting_sem, 0, MAX_ACTIVE_THREADS) < 0){
         perror("sem_init");
@@ -592,6 +729,7 @@ int main(int argc, char **argv)
 
         conn->file_descriptor = client_file_descriptor;
         conn->connection_id = ++accepted;
+        conn->slot = register_connection(client_file_descriptor);
 
         pthread_t thread_id;
 
@@ -600,6 +738,7 @@ int main(int argc, char **argv)
         if (pthread_created != 0)
         {
             fprintf(stderr, "pthread_create failed %s\n", strerror(pthread_created));
+            unregister_connection(conn->slot);
             close(client_file_descriptor);
             free(conn);
             --accepted;
@@ -620,6 +759,8 @@ int main(int argc, char **argv)
         perror("close(listen_file_descriptor)");
     }
 
+
+    wake_connections();
 
     groups_shutdown(); 
 
