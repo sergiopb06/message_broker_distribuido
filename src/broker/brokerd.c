@@ -47,7 +47,13 @@ static sem_t g_counting_sem;
 typedef struct {
     int file_descriptor;
     unsigned long connection_id;
+    int slot; //g_connections
 } connection_t;
+
+
+//Descriptors of the active connections (-1 = free)
+static int g_connections[MAX_ACTIVE_THREADS];
+static pthread_mutex_t g_connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void on_sigint(int signum)
 {
@@ -94,6 +100,51 @@ static int install_signal_handlers(void)
 static void sem_wait_retry(sem_t *s){
     while (sem_wait(s) < 0 && errno == EINTR){}
 }
+
+
+
+static int register_connection(int file_descriptor){
+
+    int slot = -1;
+
+    pthread_mutex_lock(&g_connections_mutex);
+
+    for(int i = 0; i < MAX_ACTIVE_THREADS && slot < 0; i++){
+        if(g_connections[i] < 0){
+            g_connections[i] = file_descriptor;
+            slot = i;
+        }
+    }
+
+    pthread_mutex_unlock(&g_connections_mutex);
+    return slot;
+}
+
+
+static void unregister_connection(int slot){
+
+    if(slot < 0)
+        return;
+
+    pthread_mutex_lock(&g_connections_mutex);
+    g_connections[slot] = -1;
+    pthread_mutex_unlock(&g_connections_mutex);
+}
+
+
+
+static void wake_connections(void){
+    pthread_mutex_lock(&g_connections_mutex);
+
+    for(int i = 0; i < MAX_ACTIVE_THREADS; i++){
+        if(g_connections[i] >= 0)
+            shutdown(g_connections[i], SHUT_RD);
+    }
+
+    pthread_mutex_unlock(&g_connections_mutex);
+}
+
+
 
 
 static const char *status_text(int status){
@@ -478,6 +529,8 @@ static void *handle_connection(void *arg)
 
     //A consumer that disconnects without LEAVE
     group_member_gone(conn->connection_id);
+
+    unregister_connection(conn->slot);
         
     if (close(conn->file_descriptor) < 0)
         perror("close(file_descriptor)");
@@ -606,6 +659,11 @@ int main(int argc, char **argv)
     if(install_signal_handlers() < 0)
         return EXIT_FAILURE;
 
+
+    for(int i = 0; i < MAX_ACTIVE_THREADS; i++)
+        g_connections[i] = -1;
+
+
     if(sem_init(&g_counting_sem, 0, MAX_ACTIVE_THREADS) < 0){
         perror("sem_init");
         return EXIT_FAILURE;
@@ -671,6 +729,7 @@ int main(int argc, char **argv)
 
         conn->file_descriptor = client_file_descriptor;
         conn->connection_id = ++accepted;
+        conn->slot = register_connection(client_file_descriptor);
 
         pthread_t thread_id;
 
@@ -679,6 +738,7 @@ int main(int argc, char **argv)
         if (pthread_created != 0)
         {
             fprintf(stderr, "pthread_create failed %s\n", strerror(pthread_created));
+            unregister_connection(conn->slot);
             close(client_file_descriptor);
             free(conn);
             --accepted;
@@ -699,6 +759,8 @@ int main(int argc, char **argv)
         perror("close(listen_file_descriptor)");
     }
 
+
+    wake_connections();
 
     groups_shutdown(); 
 
