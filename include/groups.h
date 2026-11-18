@@ -14,7 +14,7 @@ int group_join(const char *topic, const char *group, unsigned long member, int f
 int group_poll(const char *topic, const char *group, unsigned long member, size_t max_bytes, int wait_ms, char **body, size_t *len);
 
 //Saves the next offset to read of one partition.
-int group_commit(const char *topic, const char *group, unsigned long member, int64_t generation, int partition, int64_t offset);
+int group_commit(const char *topic, const char *group, unsigned long member, long generation, int partition, long offset);
 
 int group_leave(const char *topic, const char *group, unsigned long member);
 
