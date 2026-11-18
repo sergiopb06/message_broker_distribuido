@@ -15,6 +15,8 @@ typedef struct partition_log partition_log_t;
 // Reopens an existing directory: every record is validated, an incomplete tail of the last
 // segment is dropped, and a corrupt earlier segment or a gap between segments fails with EIO.
 // The high watermark is restored from a checkpoint written by plog_flush and plog_close.
+// retention_bytes = 0 means no limit. Above the limit, whole segments are dropped oldest first,
+// but never the active segment nor data at or above the high watermark. Offsets are never reused.
 partition_log_t *plog_open(const char *dir, uint64_t retention_bytes);
 partition_log_t *plog_open_ex(const char *dir, uint64_t retention_bytes, uint64_t segment_bytes);
 
