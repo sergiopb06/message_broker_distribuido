@@ -38,6 +38,7 @@
 
 static volatile sig_atomic_t g_running = 1;
 static int listen_file_descriptor = -1;
+static int g_rank = 0;
 
 // Limits how many connection handlers can run at once.
 static sem_t g_counting_sem;
@@ -204,6 +205,56 @@ static int choose_partition(const char *key, size_t key_len, int partitions){
 //---------------------------------------------------------------------------
 
 
+//Appends one message to a partition this broker leads and replies "<partition> <offset>".
+static void produce_message(int file_descriptor, const command_t *command, const char *key, const char *value, int partition, int replication){
+
+    partition_log_t *log = meta_get_log(command->topic, partition);
+
+    if(log == NULL){
+        (void)protocol_send_response(file_descriptor, 0, "ERROR");
+        return;
+    }
+
+
+    message_t message;
+    memset(&message, 0, sizeof message);
+    message.key_len = (uint32_t)command->key_len;
+    message.value_len = (uint32_t)command->value_len;
+    message.value = (char *)value;
+
+    if(command->key_len > 0)
+        message.key = (char *)key;
+
+    char reply[64];
+
+    //acks 0
+    if(command->acks == ACKS_NONE){
+        snprintf(reply, sizeof reply, "%d -1", partition);
+        (void)protocol_send_response(file_descriptor, 1, reply);
+    }
+
+
+    long offset;
+    int status = plog_append(log, &message, 1, &offset);
+
+    //TO DO B: with replicas the HWM moves with the fetches of the ISR and acks ALL waits for it.
+    //With replication 1 the leader is the whole ISR, so the HWM is its LEO
+
+
+    if(status == MB_OK && replication == 1)
+        plog_set_hwm(log, offset + 1);
+
+    if(command->acks == ACKS_NONE)
+        return;
+
+    if(status != MB_OK){
+        (void)protocol_send_response(file_descriptor, 0, status_text(status));
+        return;
+    }
+
+    snprintf(reply, sizeof reply, "%d %ld", partition, offset);
+    (void)protocol_send_response(file_descriptor, 1, reply);
+}
 
 
 
@@ -346,7 +397,34 @@ static int server_command(int file_descriptor, unsigned long member, const comma
 
 
 
-    //NEED TO IMPLEMENT PRODUCE
+
+    //PRODUCE
+    else if(command->type == C_PRODUCE){
+
+        topic_info_t info;
+        partition_info_t where;
+        int partition = -1;
+        int status = meta_topic_info(command->topic, &info);
+
+        if(status == MB_OK){
+            partition = choose_partition(key, command->key_len, info.partitions);
+            status = meta_get_partition(command->topic, partition, &where);
+        }
+
+        if(status != MB_OK)
+            (void)protocol_send_response(file_descriptor, 0, status_text(status));
+
+
+        else if(where.leader != g_rank){
+            char reply[64];
+            snprintf(reply, sizeof reply, "NOT_LEADER %d", where.leader);
+            (void)protocol_send_response(file_descriptor, 0, reply);
+        }
+
+
+        else
+            produce_message(file_descriptor, command, key, value, partition, info.replication);
+    }
 
 
     free(key);
@@ -485,6 +563,8 @@ int main(int argc, char **argv)
     if(mpil_init(&argc, &argv, &rank, &size) < 0)
         return EXIT_FAILURE;
 
+    g_rank = rank;
+
     if(parse_args(argc, argv, &base_port, &data_directory) < 0)
         return EXIT_FAILURE;
 
@@ -520,7 +600,6 @@ int main(int argc, char **argv)
     }
 
 
-    //TO DO A : open the partition logs of this broker
     //TO DO B : start the MPI receiver, fetch and heartbeat threads
  
 
