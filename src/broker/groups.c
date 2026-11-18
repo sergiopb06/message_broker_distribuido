@@ -71,9 +71,6 @@ static FILE *g_commit_file;
 static pthread_mutex_t g_commit_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
-//TO DO A: log of the partition if this broker keeps it, or NULL.
-//TEMP DEF, REMOVE WHEN IMPLEMENTED.
-partition_log_t *meta_get_log(const char *topic, int partition);
 
 
 //HELPERS
