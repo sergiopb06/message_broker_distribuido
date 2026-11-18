@@ -6,11 +6,14 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <unistd.h>
 
 #include "groups.h"
 #include "common.h"
 #include "protocol.h"
 #include "metadata.h"
+#include "log.h"
 
 #define MAX_GROUPS 64
 #define MAX_MEMBERS 32
@@ -18,6 +21,7 @@
 #define NO_OWNER 0
 #define NO_OFFSET (-1)
 #define REBALANCE_TIMEOUT_SECONDS 10
+#define MAX_POLL_WAIT_MS 5000 //below REBALANCE_TIMEOUT_SECONDS, so a POLL never makes its member late
 
 
 typedef enum{
@@ -67,6 +71,9 @@ static FILE *g_commit_file;
 static pthread_mutex_t g_commit_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
+//TO DO A: log of the partition if this broker keeps it, or NULL.
+//TEMP DEF, REMOVE WHEN IMPLEMENTED.
+partition_log_t *meta_get_log(const char *topic, int partition);
 
 
 //HELPERS
@@ -145,16 +152,6 @@ static void remove_member_at(group_t *group, int index){
 
 
 
-static void remove_member(group_t *group, unsigned long id){
-    int index = find_member(group, id);
-    if(index < 0)
-        return;
-
-    remove_member_at(group, index);
-    start_rebalance(group);
-    try_finish_rebalance(group); //if it was the last member, the group becomes empty
-}
-
 
 
 static void start_rebalance(group_t *group){
@@ -198,6 +195,7 @@ static void try_finish_rebalance(group_t *group){
 }
 
 
+
 static void remove_late_members(group_t *group){
     int removed = 0;
 
@@ -213,12 +211,24 @@ static void remove_late_members(group_t *group){
 }
 
 
+
+static void remove_member(group_t *group, unsigned long id){
+    int index = find_member(group, id);
+    if(index < 0)
+        return;
+
+    remove_member_at(group, index);
+    start_rebalance(group);
+    try_finish_rebalance(group); //if it was the last member, the group becomes empty
+}
+
+
 static int save_commit(const group_t *group, int partition, long offset){
     int result = 0;
 
     pthread_mutex_lock(&g_commit_mutex);
 
-    if(fprintf(g_commit_file, "%s %s %d %ld\n", group->topic, group->name, partition, offset) < 0 || fflush(g_commit_file) != 0)
+    if(g_commit_file == NULL || fprintf(g_commit_file, "%s %s %d %ld\n", group->topic, group->name, partition, offset) < 0 || fflush(g_commit_file) != 0)
         result = -1;
 
     pthread_mutex_unlock(&g_commit_mutex);
@@ -250,6 +260,81 @@ static void write_assignment(const group_t *group, unsigned long id, char *out, 
     if(!any && used < size)
         snprintf(out + used, size - used, "-");
 }
+
+
+static long start_position(const group_t *group, int index, int partition, partition_log_t *log){
+    if(group->committed[partition] != NO_OFFSET)
+        return group->committed[partition];
+
+    if(group->members[index].from_beginning)
+        return plog_start_offset(log);
+
+
+    return plog_hwm(log);
+}
+
+//POLL body: "<partition> <count>\n", then "<offset> <key_len> <value_len>\n<key><value>" per message
+static int encode_messages(int partition, const message_t *msgs, size_t n, char **body, size_t *len){
+    size_t size = 32;
+
+
+    for(size_t i = 0; i < n; i++)
+        size += 64 + msgs[i].key_len + msgs[i].value_len;
+
+
+    char *out = malloc(size);
+    if(out == NULL)
+        return -1;
+
+
+    size_t used = (size_t)snprintf(out, size, "%d %zu\n", partition, n);
+
+    for(size_t i = 0; i < n; i++){
+        used += (size_t)snprintf(out + used, size - used, "%ld %u %u\n", (long)msgs[i].offset, (unsigned)msgs[i].key_len, (unsigned)msgs[i].value_len);
+
+        if(msgs[i].key_len > 0){
+            memcpy(out + used, msgs[i].key, msgs[i].key_len);
+            used += msgs[i].key_len;
+        }
+
+
+        memcpy(out + used, msgs[i].value, msgs[i].value_len);
+        used += msgs[i].value_len;
+    }
+
+
+    *body = out;
+    *len = used;
+    return 0;
+}
+
+
+
+static void append_text(char *out, size_t size, size_t *used, const char *format, ...){
+    if(*used >= size)
+        return;
+
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(out + *used, size - *used, format, args);
+    va_end(args);
+
+
+    if(written > 0)
+        *used += (size_t)written;
+}
+
+
+static const char *state_text(group_state_t state){
+    if(state == GROUP_STABLE)
+        return "stable";
+
+    if(state == GROUP_REBALANCING)
+        return "rebalancing";
+
+    return "empty";
+}
+
 
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -296,28 +381,28 @@ int groups_init(const char *data_dir, int rank, int size){
 
 
 int group_join(const char *topic, const char *name, unsigned long member, int from_beginning, char *out, size_t size){
-    //TO DO B: forward to the coordinator when has(name) % g_size != g_rank
+    //TO DO B: forward to the coordinator when hash(name) % g_size != g_rank
 
-    int partitions = meta_partition_count(topic);
-    if(partitions < 0)
-        return MB_ERR_UNKNOWN_TOPIC;
+    topic_info_t info;
+    int status = meta_topic_info(topic, &info);
+    if(status != MB_OK)
+        return status;
 
-    if(partitions > MAX_PARTITIONS)
+    if(info.partitions > MAX_PARTITIONS)
         return -1;
 
 
     group_t *group = get_group(topic, name, 1);
     if(group == NULL)
         return -1;
-    
+
 
     unsigned long id = member_id(member);
-    int status = MB_OK;
 
     pthread_mutex_lock(&group->mutex);
 
     if(group->partitions == 0)
-        group->partitions = partitions;
+        group->partitions = info.partitions;
 
     
     //A new member changes the group: start a rebalance
@@ -412,6 +497,10 @@ void group_member_gone(unsigned long member){
 int group_commit(const char *topic, const char *name, unsigned long member, long generation, int partition, long offset){
     //TO DO B: forward to the coordinator when hash(name) % g_size != g_rank
 
+    if(atomic_load(&g_stopping))
+        return MB_ERR_SHUTTING_DOWN;
+
+        
     if(offset < 0)
         return MB_ERR_OFFSET_OUT_OF_RANGE;
 
@@ -419,7 +508,7 @@ int group_commit(const char *topic, const char *name, unsigned long member, long
     if(group == NULL)
         return MB_ERR_REBALANCE;   
 
-        
+
     unsigned long id = member_id(member);
     int status = MB_OK;
 
@@ -439,4 +528,272 @@ int group_commit(const char *topic, const char *name, unsigned long member, long
 
     pthread_mutex_unlock(&group->mutex);
     return status;
+}
+
+
+
+
+int group_poll(const char *topic, const char *name, unsigned long member, size_t max_bytes, int wait_ms, char **body, size_t *len){
+    //TO DO B: forward to the coordinator when hash(name) % g_size != g_rank
+
+
+    if(atomic_load(&g_stopping))
+        return MB_ERR_SHUTTING_DOWN;
+
+
+    *body = NULL;
+    *len = 0;
+
+    if(wait_ms < 0)
+        wait_ms = 0;
+
+    if(wait_ms > MAX_POLL_WAIT_MS)
+        wait_ms = MAX_POLL_WAIT_MS;
+
+    group_t *group = get_group(topic, name, 0);
+
+    if(group == NULL)
+        return MB_ERR_REBALANCE;   
+
+
+    unsigned long id = member_id(member);
+
+    pthread_mutex_lock(&group->mutex);
+
+
+
+    //1. Only a member of the current generation, with the group stable, can read
+    int index = find_member(group, id);
+    if(index < 0 || group->state != GROUP_STABLE || group->members[index].generation != group->generation){
+        pthread_mutex_unlock(&group->mutex);
+        return MB_ERR_REBALANCE;
+    }
+
+
+
+    long generation = group->generation;
+
+
+
+
+    //2. Choose one of its partitions, starting after the last one it read.
+    int chosen = -1;
+    int has_data = 0;
+    partition_log_t *log = NULL;
+    long from = 0;
+
+    for(int step = 0; step < group->partitions && !has_data; step++){
+        int partition = (group->members[index].next_poll + step) % group->partitions;
+
+        if(group->owner[partition] != id)
+            continue;
+
+        partition_log_t *candidate = meta_get_log(topic, partition);
+        if(candidate == NULL)
+            continue; //TO DO B: the log is in another broker, read it from the leader
+
+
+        if(group->position[partition] == NO_OFFSET)
+            group->position[partition] = start_position(group, index, partition, candidate);
+
+
+        int ready = plog_hwm(candidate) > group->position[partition];
+
+        if(chosen < 0 || ready){
+            chosen = partition;
+            log = candidate;
+            from = group->position[partition];
+            has_data = ready;
+        }
+    }
+
+
+    //A member without partitions sleeps until wait_ms or a rebalance
+    if(chosen < 0){
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += wait_ms / 1000;
+        deadline.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
+
+
+        if(deadline.tv_nsec >= 1000000000L){
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+
+
+
+        while(group->generation == generation && !atomic_load(&g_stopping)){
+
+            if(pthread_cond_timedwait(&group->changed, &group->mutex, &deadline) == ETIMEDOUT)
+                break;
+        }
+
+        int status = MB_OK;
+
+        if(atomic_load(&g_stopping))
+            status = MB_ERR_SHUTTING_DOWN;
+
+
+        else if(group->generation != generation)
+            status = MB_ERR_REBALANCE;
+
+
+        pthread_mutex_unlock(&group->mutex);
+
+
+        if(status == MB_OK && encode_messages(-1, NULL, 0, body, len) != 0)
+            status = -1;
+
+        return status;
+    }
+
+
+    group->members[index].next_poll = chosen + 1;
+    pthread_mutex_unlock(&group->mutex);
+
+
+
+    //3. Wait and read without the group mutex
+    if(!has_data){
+        int waited = plog_wait_data(log, from, true, wait_ms);
+
+        if(waited == MB_ERR_TIMEOUT){
+            if(encode_messages(chosen, NULL, 0, body, len) != 0)
+                return -1;
+            return MB_OK;   //nothing new is not an error
+        }
+
+        if(waited != MB_OK)
+            return waited;
+    }
+
+    message_t *msgs = NULL;
+    size_t n = 0;
+    int status = plog_read(log, from, max_bytes, true, &msgs, &n);
+
+
+    if(status != MB_OK)
+        return status;
+
+
+
+
+    //4. Deliver only if it still owns the partition
+    pthread_mutex_lock(&group->mutex);
+
+    if(group->generation != generation || group->owner[chosen] != id)
+        status = MB_ERR_REBALANCE;
+
+    else if(n > 0)
+        group->position[chosen] = (long)msgs[n - 1].offset + 1;
+
+    pthread_mutex_unlock(&group->mutex);
+
+
+
+
+    //5. Build the reply
+    if(status == MB_OK && encode_messages(chosen, msgs, n, body, len) != 0)
+        status = -1;
+
+    plog_free_messages(msgs);
+    return status;
+}
+
+
+
+int group_describe(const char *name, char *out, size_t size){
+    //TO DO B: forward to the coordinator when hash(name) % g_size != g_rank
+
+
+    size_t used = 0;
+    int found = 0;
+    out[0] = '\0';
+
+    pthread_mutex_lock(&g_groups_mutex);
+
+    for(int i = 0; i < MAX_GROUPS; i++){
+        group_t *group = &g_groups[i];
+
+
+        if(!group->used || strcmp(group->name, name) != 0)
+            continue;
+
+
+        found = 1;
+        pthread_mutex_lock(&group->mutex);
+
+
+        append_text(out, size, &used, "group %s topic %s state %s generation %ld\n", group->name, group->topic, state_text(group->state), group->generation);
+
+        for(int partition = 0; partition < group->partitions; partition++){
+            append_text(out, size, &used, "  partition %d member ", partition);
+
+            if(group->owner[partition] == NO_OWNER)
+                append_text(out, size, &used, "-");
+
+
+            else
+                append_text(out, size, &used, "%lu:%lu", group->owner[partition] >> 32, group->owner[partition] & 0xFFFFFFFFUL);
+
+
+            partition_log_t *log = meta_get_log(group->topic, partition); //TO DO B: HWM of remote logs
+
+
+            if(group->committed[partition] == NO_OFFSET || log == NULL)
+                append_text(out, size, &used, " committed - lag -\n");
+
+
+            else
+                append_text(out, size, &used, " committed %ld lag %ld\n", group->committed[partition], (long)plog_hwm(log) - group->committed[partition]);
+        }
+
+        pthread_mutex_unlock(&group->mutex);
+    }
+
+    pthread_mutex_unlock(&g_groups_mutex);
+
+    if(!found)
+        append_text(out, size, &used, "group %s not found\n", name);
+
+
+
+    return MB_OK;
+}
+
+
+
+//wake every JOIN and POLL waiting on a group and make the committed offsets durable
+
+void groups_shutdown(void){
+    atomic_store(&g_stopping, 1);
+
+    pthread_mutex_lock(&g_groups_mutex);
+
+    for(int i = 0; i < MAX_GROUPS; i++){
+        if(!g_groups[i].used)
+            continue;
+
+
+
+        pthread_mutex_lock(&g_groups[i].mutex);
+        pthread_cond_broadcast(&g_groups[i].changed);
+        pthread_mutex_unlock(&g_groups[i].mutex);
+    }
+
+    pthread_mutex_unlock(&g_groups_mutex);
+
+
+    pthread_mutex_lock(&g_commit_mutex);
+
+
+    if(g_commit_file != NULL){
+        fflush(g_commit_file);
+        fsync(fileno(g_commit_file));
+        fclose(g_commit_file);
+        g_commit_file = NULL;
+    }
+
+    pthread_mutex_unlock(&g_commit_mutex);
 }
