@@ -22,6 +22,8 @@
 #include <limits.h>
 #include <sys/time.h>
 #include <stdint.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 
 #define DEFAULT_PORT 9000
@@ -492,6 +494,9 @@ static void *handle_connection(void *arg)
     //A client that connects and sends nothing can't keep this handler blocked forever
     struct timeval timeout = {IDLE_TIMEOUT_SECONDS, 0};
     (void)setsockopt(conn->file_descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+
+    int on = 1;
+    (void)setsockopt(conn->file_descriptor, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
 
     while (g_running){
         errno = 0;

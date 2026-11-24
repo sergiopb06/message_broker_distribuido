@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <netinet/tcp.h>
 
 int nu_listen(unsigned short port, int backlog)
 {
@@ -148,6 +149,9 @@ int nu_connect(const char  *host, unsigned short port)
         close(file_descriptor);
         return -1;
     }
+
+    int on = 1;
+    (void)setsockopt(file_descriptor, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
 
     return file_descriptor;
 
