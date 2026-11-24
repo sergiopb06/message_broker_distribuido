@@ -70,7 +70,11 @@ int server_is_running(void){
 
 void server_request_shutdown(void){
     g_running = 0;
-    shutdown(listen_file_descriptor, SHUT_RD);
+    // A paused broker would otherwise keep every connection thread asleep and
+    // the cluster would never finish the ordered shutdown.
+    repl_set_paused(false);
+    if(listen_file_descriptor >= 0)
+        shutdown(listen_file_descriptor, SHUT_RD);
 }
 
 static int install_signal_handlers(void)
@@ -290,10 +294,6 @@ static void produce_message(int file_descriptor, const command_t *command, const
     long offset;
     int status = plog_append(log, &message, 1, &offset);
 
-    //TO DO B: with replicas the HWM moves with the fetches of the ISR and acks ALL waits for it.
-    //With replication 1 the leader is the whole ISR, so the HWM is its LEO
-
-
     if(status == MB_OK && replication == 1)
         plog_set_hwm(log, offset + 1);
 
@@ -303,6 +303,14 @@ static void produce_message(int file_descriptor, const command_t *command, const
     if(status != MB_OK){
         (void)protocol_send_response(file_descriptor, 0, status_text(status));
         return;
+    }
+
+    if(command->acks == ACKS_ALL && replication > 1){
+        status = repl_wait_acks(command->topic, partition, offset, command->acks, 5000);
+        if(status != MB_OK){
+            (void)protocol_send_response(file_descriptor, 0, status_text(status));
+            return;
+        }
     }
 
     snprintf(reply, sizeof reply, "%d %ld", partition, offset);
@@ -344,6 +352,11 @@ static int server_command(int file_descriptor, unsigned long member, const comma
     //TOPIC CREATE
     if(command->type == C_TOPIC_CREATE){
         int status = meta_create_topic(command->topic, command->partitions, command->replication, (uint64_t)command->retention_bytes);
+        if(status == MB_ERR_NOT_LEADER && g_rank != 0){
+            status = repl_forward_topic_create(command->topic, command->partitions, command->replication, (uint64_t)command->retention_bytes);
+        } else if(status == MB_OK && g_rank == 0){
+            repl_broadcast_metadata();
+        }
 
         if(status == MB_OK)
             (void)protocol_send_response(file_descriptor, 1, "topic created");
@@ -469,9 +482,22 @@ static int server_command(int file_descriptor, unsigned long member, const comma
 
 
         else if(where.leader != g_rank){
-            char reply[64];
-            snprintf(reply, sizeof reply, "NOT_LEADER %d", where.leader);
-            (void)protocol_send_response(file_descriptor, 0, reply);
+            // The leader can be another broker: forward the append over MPI.
+            long offset = -1;
+            int forwarded = repl_forward_produce(command->topic, partition, key, command->key_len,
+                                                 value, command->value_len, command->acks, &offset);
+
+            if(forwarded != MB_OK){
+                (void)protocol_send_response(file_descriptor, 0, status_text(forwarded));
+            } else if(command->acks == ACKS_NONE){
+                char reply[64];
+                snprintf(reply, sizeof reply, "%d -1", partition);
+                (void)protocol_send_response(file_descriptor, 1, reply);
+            } else {
+                char reply[64];
+                snprintf(reply, sizeof reply, "%d %ld", partition, offset);
+                (void)protocol_send_response(file_descriptor, 1, reply);
+            }
         }
 
 
@@ -525,6 +551,15 @@ static void *handle_connection(void *arg)
             (void)protocol_send_response(conn->file_descriptor, 0, command.error);
             break;
         }
+
+        // Paused broker: replication stops, but PAUSE, RESUME and SHUTDOWN must
+        // still be accepted, otherwise the broker could never be resumed.
+        if (repl_is_paused() && command.type != C_BROKER_PAUSE
+            && command.type != C_BROKER_RESUME && command.type != C_SHUTDOWN)
+            repl_wait_if_paused();
+
+        if (!g_running)
+            break;
 
         if(server_command(conn->file_descriptor, conn->connection_id, &command) < 0)
             break;
@@ -657,9 +692,11 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-
-    //TO DO B : start the MPI receiver, fetch and heartbeat threads
- 
+    if(repl_init(rank, size) != 0 || repl_start() != 0){
+        groups_shutdown();
+        meta_destroy();
+        return EXIT_FAILURE;
+    }
 
     if(install_signal_handlers() < 0)
         return EXIT_FAILURE;
@@ -769,15 +806,18 @@ int main(int argc, char **argv)
 
     groups_shutdown(); 
 
+    // No forwarded request can succeed once we are stopping: unblock every
+    // handler that is waiting for an MPI reply before joining them.
+    mpil_abort_requests();
 
     //wait for every handler to finish
     for(int i = 0; i < MAX_ACTIVE_THREADS; i++){
         sem_wait_retry(&g_counting_sem);
     }
 
-    meta_destroy();
+    repl_shutdown();
 
-    //TO DO B: phases 3 to 6 of the shutdown (flush, stop threads, MPI barrier, MPI_Finalize)
+    meta_destroy();
 
     sem_destroy(&g_counting_sem);
 
