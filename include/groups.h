@@ -2,6 +2,7 @@
 #define GROUPS_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 //member is the id of the client connection that joined the group
 
@@ -22,5 +23,7 @@ void group_member_gone(unsigned long member);
 
 //Text with the members, their partitions, the last committed offset and the lag.
 int group_describe(const char *group, char *out, size_t size);
+
+void groups_handle_forward(int source, uint64_t req_id, const char *line, size_t len);
 
 #endif //GROUPS_H

@@ -14,6 +14,8 @@
 #include "protocol.h"
 #include "metadata.h"
 #include "log.h"
+#include "mpi_layer.h"
+#include "replication.h"
 
 #define MAX_GROUPS 64
 #define MAX_MEMBERS 32
@@ -69,6 +71,24 @@ static int g_size;
 static atomic_int g_stopping;
 static FILE *g_commit_file;
 static pthread_mutex_t g_commit_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t group_fnv1a(const char *data, size_t len)
+{
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (unsigned char)data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static int group_coordinator(const char *name)
+{
+    if (g_size <= 1) {
+        return 0;
+    }
+    return (int)(group_fnv1a(name, strlen(name)) % (uint32_t)g_size);
+}
 
 
 
@@ -259,17 +279,6 @@ static void write_assignment(const group_t *group, unsigned long id, char *out, 
 }
 
 
-static long start_position(const group_t *group, int index, int partition, partition_log_t *log){
-    if(group->committed[partition] != NO_OFFSET)
-        return group->committed[partition];
-
-    if(group->members[index].from_beginning)
-        return plog_start_offset(log);
-
-
-    return plog_hwm(log);
-}
-
 //POLL body: "<partition> <count>\n", then "<offset> <key_len> <value_len>\n<key><value>" per message
 static int encode_messages(int partition, const message_t *msgs, size_t n, char **body, size_t *len){
     size_t size = 32;
@@ -336,11 +345,16 @@ static const char *state_text(group_state_t state){
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+static void handle_group_gone(int source, const void *buf, size_t len, void *arg);
+
 int groups_init(const char *data_dir, int rank, int size){
    snprintf(g_data_dir, sizeof g_data_dir, "%s", data_dir);
    g_rank = rank;
    g_size = size;
    atomic_store(&g_stopping, 0);
+
+   // A client that disconnects without LEAVE is removed everywhere.
+   mpil_register(MPIL_TAG_GROUP_GONE, handle_group_gone, NULL);
 
    char path[512];
    snprintf(path, sizeof path, "%s/commits.log", g_data_dir);
@@ -377,9 +391,38 @@ int groups_init(const char *data_dir, int rank, int size){
 
 
 
-int group_join(const char *topic, const char *name, unsigned long member, int from_beginning, char *out, size_t size){
-    //TO DO B: forward to the coordinator when hash(name) % g_size != g_rank
+// `id` is already the cluster-wide id: (origin rank << 32) | connection.
+// Forwarded requests carry that id, so members from different brokers never collide.
+static int group_join_id(const char *topic, const char *name, unsigned long id, int from_beginning, char *out, size_t size);
 
+int group_join(const char *topic, const char *name, unsigned long member, int from_beginning, char *out, size_t size){
+    int coord = group_coordinator(name);
+    unsigned long id = member_id(member);
+
+    if(coord != g_rank){
+        char req[256];
+        snprintf(req, sizeof(req), "JOIN %s %s %lu %d", topic, name, id, from_beginning);
+        void *reply = NULL;
+        size_t reply_len = 0;
+        int rc = mpil_request(coord, MPIL_TAG_FORWARD_REQ, req, strlen(req) + 1, &reply, &reply_len, 5000);
+        if(rc != MB_OK){
+            free(reply);
+            return rc;
+        }
+        int status = -1;
+        char body[2048] = {0};
+        if(reply != NULL && reply_len > 0)
+            (void)sscanf((const char *)reply, "%d %[^\n]", &status, body);
+        if(out != NULL && size > 0)
+            snprintf(out, size, "%s", body);
+        free(reply);
+        return status;
+    }
+
+    return group_join_id(topic, name, id, from_beginning, out, size);
+}
+
+static int group_join_id(const char *topic, const char *name, unsigned long id, int from_beginning, char *out, size_t size){
     topic_info_t info;
     int status = meta_topic_info(topic, &info);
     if(status != MB_OK)
@@ -392,9 +435,6 @@ int group_join(const char *topic, const char *name, unsigned long member, int fr
     group_t *group = get_group(topic, name, 1);
     if(group == NULL)
         return -1;
-
-
-    unsigned long id = member_id(member);
 
     pthread_mutex_lock(&group->mutex);
 
@@ -454,26 +494,44 @@ int group_join(const char *topic, const char *name, unsigned long member, int fr
 
 
 
-int group_leave(const char *topic, const char *name, unsigned long member){
-    //TO DO B: forward to the coordinator when hash(name) % g_size != g_rank
-
+static int group_leave_id(const char *topic, const char *name, unsigned long id){
     group_t *group = get_group(topic, name, 0);
     if(group == NULL)
-        return MB_OK; 
+        return MB_OK;
 
     pthread_mutex_lock(&group->mutex);
-    remove_member(group, member_id(member));
+    remove_member(group, id);
     pthread_mutex_unlock(&group->mutex);
 
     return MB_OK;
 }
 
-
-void group_member_gone(unsigned long member){
-    //TO DO B: tell the other brokers too, the member may be in groups they coordinate
-
+int group_leave(const char *topic, const char *name, unsigned long member){
+    int coord = group_coordinator(name);
     unsigned long id = member_id(member);
 
+    if(coord != g_rank){
+        char req[256];
+        snprintf(req, sizeof(req), "LEAVE %s %s %lu", topic, name, id);
+        void *reply = NULL;
+        size_t reply_len = 0;
+        int rc = mpil_request(coord, MPIL_TAG_FORWARD_REQ, req, strlen(req) + 1, &reply, &reply_len, 5000);
+        if(rc != MB_OK){
+            free(reply);
+            return rc;
+        }
+        int status = -1;
+        if(reply != NULL && reply_len >= sizeof(int)){
+            memcpy(&status, reply, sizeof(int));
+        }
+        free(reply);
+        return status;
+    }
+
+    return group_leave_id(topic, name, id);
+}
+
+static void remove_member_from_all_groups(unsigned long id){
     pthread_mutex_lock(&g_groups_mutex);
 
     for(int i = 0; i < MAX_GROUPS; i++){
@@ -488,25 +546,45 @@ void group_member_gone(unsigned long member){
     pthread_mutex_unlock(&g_groups_mutex);
 }
 
+static void handle_group_gone(int source, const void *buf, size_t len, void *arg){
+    (void)source;
+    (void)arg;
+
+    if(len < sizeof(unsigned long))
+        return;
+
+    unsigned long id = 0;
+    memcpy(&id, buf, sizeof id);
+    remove_member_from_all_groups(id);
+}
+
+void group_member_gone(unsigned long member){
+    unsigned long id = member_id(member);
+
+    if(g_size > 1){
+        for(int r = 0; r < g_size; r++){
+            if(r != g_rank)
+                mpil_send(r, MPIL_TAG_GROUP_GONE, &id, sizeof id);
+        }
+    }
+
+    remove_member_from_all_groups(id);
+}
 
 
 
-int group_commit(const char *topic, const char *name, unsigned long member, long generation, int partition, long offset){
-    //TO DO B: forward to the coordinator when hash(name) % g_size != g_rank
 
+static int group_commit_id(const char *topic, const char *name, unsigned long id, long generation, int partition, long offset){
     if(atomic_load(&g_stopping))
         return MB_ERR_SHUTTING_DOWN;
 
-        
     if(offset < 0)
         return MB_ERR_OFFSET_OUT_OF_RANGE;
 
     group_t *group = get_group(topic, name, 0);
     if(group == NULL)
-        return MB_ERR_REBALANCE;   
+        return MB_ERR_REBALANCE;
 
-
-    unsigned long id = member_id(member);
     int status = MB_OK;
 
     pthread_mutex_lock(&group->mutex);
@@ -527,13 +605,73 @@ int group_commit(const char *topic, const char *name, unsigned long member, long
     return status;
 }
 
+int group_commit(const char *topic, const char *name, unsigned long member, long generation, int partition, long offset){
+    int coord = group_coordinator(name);
+    unsigned long id = member_id(member);
+
+    if(coord != g_rank){
+        char req[256];
+        snprintf(req, sizeof(req), "COMMIT %s %s %lu %ld %d %ld", topic, name, id, generation, partition, offset);
+        void *reply = NULL;
+        size_t reply_len = 0;
+        int rc = mpil_request(coord, MPIL_TAG_FORWARD_REQ, req, strlen(req) + 1, &reply, &reply_len, 5000);
+        if(rc != MB_OK){
+            free(reply);
+            return rc;
+        }
+        int status = -1;
+        if(reply != NULL && reply_len >= sizeof(int)){
+            memcpy(&status, reply, sizeof(int));
+        }
+        free(reply);
+        return status;
+    }
+
+    return group_commit_id(topic, name, id, generation, partition, offset);
+}
 
 
+
+
+static int group_poll_id(const char *topic, const char *name, unsigned long id, size_t max_bytes, int wait_ms, char **body, size_t *len);
 
 int group_poll(const char *topic, const char *name, unsigned long member, size_t max_bytes, int wait_ms, char **body, size_t *len){
-    //TO DO B: forward to the coordinator when hash(name) % g_size != g_rank
+    int coord = group_coordinator(name);
+    unsigned long id = member_id(member);
 
+    if(coord != g_rank){
+        char req[256];
+        snprintf(req, sizeof(req), "POLL %s %s %lu %zu %d", topic, name, id, max_bytes, wait_ms);
+        void *reply = NULL;
+        size_t reply_len = 0;
+        int rc = mpil_request(coord, MPIL_TAG_FORWARD_REQ, req, strlen(req) + 1, &reply, &reply_len, wait_ms + 2000);
+        if(rc != MB_OK){
+            free(reply);
+            return rc;
+        }
+        if(reply == NULL || reply_len < sizeof(int) + sizeof(uint32_t)){
+            free(reply);
+            return -1;
+        }
+        int status = 0;
+        uint32_t body_len = 0;
+        memcpy(&status, reply, sizeof(int));
+        memcpy(&body_len, (const char *)reply + sizeof(int), sizeof(uint32_t));
+        if(body_len > 0 && reply_len >= sizeof(int) + sizeof(uint32_t) + body_len){
+            *body = malloc(body_len);
+            if(*body != NULL){
+                memcpy(*body, (const char *)reply + sizeof(int) + sizeof(uint32_t), body_len);
+                *len = body_len;
+            }
+        }
+        free(reply);
+        return status;
+    }
 
+    return group_poll_id(topic, name, id, max_bytes, wait_ms, body, len);
+}
+
+static int group_poll_id(const char *topic, const char *name, unsigned long id, size_t max_bytes, int wait_ms, char **body, size_t *len){
     if(atomic_load(&g_stopping))
         return MB_ERR_SHUTTING_DOWN;
 
@@ -552,8 +690,6 @@ int group_poll(const char *topic, const char *name, unsigned long member, size_t
     if(group == NULL)
         return MB_ERR_REBALANCE;   
 
-
-    unsigned long id = member_id(member);
 
     pthread_mutex_lock(&group->mutex);
 
@@ -574,9 +710,10 @@ int group_poll(const char *topic, const char *name, unsigned long member, size_t
 
 
     //2. Choose one of its partitions, starting after the last one it read.
+    //   The log may live on another broker; repl_partition_offsets and
+    //   repl_read take care of asking its leader over MPI.
     int chosen = -1;
     int has_data = 0;
-    partition_log_t *log = NULL;
     long from = 0;
 
     for(int step = 0; step < group->partitions && !has_data; step++){
@@ -585,20 +722,27 @@ int group_poll(const char *topic, const char *name, unsigned long member, size_t
         if(group->owner[partition] != id)
             continue;
 
-        partition_log_t *candidate = meta_get_log(topic, partition);
-        if(candidate == NULL)
-            continue; //TO DO B: the log is in another broker, read it from the leader
+        int64_t start = 0;
+        int64_t hwm = 0;
+        int64_t leo = 0;
+        if(repl_partition_offsets(topic, partition, &start, &hwm, &leo) != MB_OK)
+            continue;
 
+        if(group->position[partition] == NO_OFFSET){
+            if(group->committed[partition] != NO_OFFSET)
+                group->position[partition] = group->committed[partition];
 
-        if(group->position[partition] == NO_OFFSET)
-            group->position[partition] = start_position(group, index, partition, candidate);
+            else if(group->members[index].from_beginning)
+                group->position[partition] = (long)start;
 
+            else
+                group->position[partition] = (long)hwm;
+        }
 
-        int ready = plog_hwm(candidate) > group->position[partition];
+        int ready = hwm > group->position[partition];
 
         if(chosen < 0 || ready){
             chosen = partition;
-            log = candidate;
             from = group->position[partition];
             has_data = ready;
         }
@@ -653,7 +797,7 @@ int group_poll(const char *topic, const char *name, unsigned long member, size_t
 
     //3. Wait and read without the group mutex
     if(!has_data){
-        int waited = plog_wait_data(log, from, true, wait_ms);
+        int waited = repl_wait_data(topic, chosen, from, wait_ms);
 
         if(waited == MB_ERR_TIMEOUT){
             if(encode_messages(chosen, NULL, 0, body, len) != 0)
@@ -667,7 +811,7 @@ int group_poll(const char *topic, const char *name, unsigned long member, size_t
 
     message_t *msgs = NULL;
     size_t n = 0;
-    int status = plog_read(log, from, max_bytes, true, &msgs, &n);
+    int status = repl_read(topic, chosen, from, max_bytes, &msgs, &n);
 
 
     if(status != MB_OK)
@@ -701,8 +845,22 @@ int group_poll(const char *topic, const char *name, unsigned long member, size_t
 
 
 int group_describe(const char *name, char *out, size_t size){
-    //TO DO B: forward to the coordinator when hash(name) % g_size != g_rank
-
+    int coord = group_coordinator(name);
+    if(coord != g_rank){
+        char req[256];
+        snprintf(req, sizeof(req), "DESCRIBE %s", name);
+        void *reply = NULL;
+        size_t reply_len = 0;
+        int rc = mpil_request(coord, MPIL_TAG_FORWARD_REQ, req, strlen(req) + 1, &reply, &reply_len, 5000);
+        if(rc != MB_OK)
+            return rc;
+        int status = *(const int *)reply;
+        if(reply_len > sizeof(int)){
+            snprintf(out, size, "%s", (const char *)reply + sizeof(int));
+        }
+        free(reply);
+        return status;
+    }
 
     size_t used = 0;
     int found = 0;
@@ -713,14 +871,11 @@ int group_describe(const char *name, char *out, size_t size){
     for(int i = 0; i < MAX_GROUPS; i++){
         group_t *group = &g_groups[i];
 
-
         if(!group->used || strcmp(group->name, name) != 0)
             continue;
 
-
         found = 1;
         pthread_mutex_lock(&group->mutex);
-
 
         append_text(out, size, &used, "group %s topic %s state %s generation %ld\n", group->name, group->topic, state_text(group->state), group->generation);
 
@@ -730,20 +885,23 @@ int group_describe(const char *name, char *out, size_t size){
             if(group->owner[partition] == NO_OWNER)
                 append_text(out, size, &used, "-");
 
-
             else
                 append_text(out, size, &used, "%lu:%lu", group->owner[partition] >> 32, group->owner[partition] & 0xFFFFFFFFUL);
 
+            partition_log_t *log = meta_get_log(group->topic, partition);
+            int64_t hwm = -1;
+            if(log != NULL){
+                hwm = plog_hwm(log);
+            } else {
+                int64_t leo = -1;
+                (void)repl_partition_state(group->topic, partition, NULL, NULL, &hwm, &leo);
+            }
 
-            partition_log_t *log = meta_get_log(group->topic, partition); //TO DO B: HWM of remote logs
-
-
-            if(group->committed[partition] == NO_OFFSET || log == NULL)
+            if(group->committed[partition] == NO_OFFSET || hwm < 0)
                 append_text(out, size, &used, " committed - lag -\n");
 
-
             else
-                append_text(out, size, &used, " committed %ld lag %ld\n", group->committed[partition], (long)plog_hwm(log) - group->committed[partition]);
+                append_text(out, size, &used, " committed %ld lag %ld\n", group->committed[partition], (long)hwm - group->committed[partition]);
         }
 
         pthread_mutex_unlock(&group->mutex);
@@ -754,9 +912,88 @@ int group_describe(const char *name, char *out, size_t size){
     if(!found)
         append_text(out, size, &used, "group %s not found\n", name);
 
-
-
     return MB_OK;
+}
+
+void groups_handle_forward(int source, uint64_t req_id, const char *line, size_t len)
+{
+    (void)len;
+    // The member id in a forwarded line is already global, so call the local
+    // implementations directly: re-encoding it here would prefix this rank.
+    if (strncmp(line, "JOIN ", 5) == 0) {
+        char topic[TOPIC_NAME_MAX], name[GROUP_NAME_MAX];
+        unsigned long member = 0;
+        int from_beginning = 0;
+        if (sscanf(line + 5, "%s %s %lu %d", topic, name, &member, &from_beginning) == 4) {
+            char body[2048] = {0};
+            int status = group_join_id(topic, name, member, from_beginning, body, sizeof(body));
+            char reply[2200];
+            snprintf(reply, sizeof(reply), "%d %s", status, body);
+            mpil_reply(source, req_id, reply, strlen(reply) + 1);
+            return;
+        }
+    } else if (strncmp(line, "LEAVE ", 6) == 0) {
+        char topic[TOPIC_NAME_MAX], name[GROUP_NAME_MAX];
+        unsigned long member = 0;
+        if (sscanf(line + 6, "%s %s %lu", topic, name, &member) == 3) {
+            int status = group_leave_id(topic, name, member);
+            mpil_reply(source, req_id, &status, sizeof(status));
+            return;
+        }
+    } else if (strncmp(line, "COMMIT ", 7) == 0) {
+        char topic[TOPIC_NAME_MAX], name[GROUP_NAME_MAX];
+        unsigned long member = 0;
+        long generation = 0, offset = 0;
+        int partition = 0;
+        if (sscanf(line + 7, "%s %s %lu %ld %d %ld", topic, name, &member, &generation, &partition, &offset) == 6) {
+            int status = group_commit_id(topic, name, member, generation, partition, offset);
+            mpil_reply(source, req_id, &status, sizeof(status));
+            return;
+        }
+    } else if (strncmp(line, "POLL ", 5) == 0) {
+        char topic[TOPIC_NAME_MAX], name[GROUP_NAME_MAX];
+        unsigned long member = 0;
+        size_t max_bytes = 0;
+        int wait_ms = 0;
+        if (sscanf(line + 5, "%s %s %lu %zu %d", topic, name, &member, &max_bytes, &wait_ms) == 5) {
+            char *body = NULL;
+            size_t body_len = 0;
+            int status = group_poll_id(topic, name, member, max_bytes, wait_ms, &body, &body_len);
+            size_t reply_len = sizeof(int) + sizeof(uint32_t) + body_len;
+            char *reply = malloc(reply_len);
+            if (reply != NULL) {
+                memcpy(reply, &status, sizeof(int));
+                uint32_t ulen = (uint32_t)body_len;
+                memcpy(reply + sizeof(int), &ulen, sizeof(uint32_t));
+                if (body_len > 0 && body != NULL) {
+                    memcpy(reply + sizeof(int) + sizeof(uint32_t), body, body_len);
+                }
+                mpil_reply(source, req_id, reply, reply_len);
+                free(reply);
+            }
+            free(body);
+            return;
+        }
+    } else if (strncmp(line, "DESCRIBE ", 9) == 0) {
+        char name[GROUP_NAME_MAX];
+        if (sscanf(line + 9, "%s", name) == 1) {
+            char body[4096] = {0};
+            int status = group_describe(name, body, sizeof(body));
+            size_t body_len = strlen(body) + 1;
+            size_t reply_len = sizeof(int) + body_len;
+            char *reply = malloc(reply_len);
+            if (reply != NULL) {
+                memcpy(reply, &status, sizeof(int));
+                memcpy(reply + sizeof(int), body, body_len);
+                mpil_reply(source, req_id, reply, reply_len);
+                free(reply);
+            }
+            return;
+        }
+    }
+
+    int err = -1;
+    mpil_reply(source, req_id, &err, sizeof(err));
 }
 
 
