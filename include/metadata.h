@@ -43,4 +43,8 @@ int meta_list(char *out, size_t size);
 
 int meta_describe(const char *topic, char *out, size_t size);
 
+int meta_get_snapshot(char **out, size_t *len);
+
+int meta_apply_snapshot(const char *text);
+
 #endif //METADATA_H

@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+__attribute__((weak)) int repl_partition_state(const char *topic, int partition, int *isr, int *n_isr, int64_t *hwm, int64_t *leo);
+
 #define META_FILE "metadata"
 #define LINE_MAX_BYTES 256
 
@@ -555,40 +557,131 @@ int meta_describe(const char *topic, char *out, size_t size)
     if (topic == NULL || out == NULL || size == 0) {
         return -1;
     }
-    char *text = NULL;
-    size_t len = 0;
+
+    // Copy what we need and release the metadata mutex before asking the
+    // replication module: it calls back into meta_get_partition/meta_get_log.
+    char name[META_NAME_MAX];
+    int partitions = 0;
+    int replication = 0;
+    uint64_t retention_bytes = 0;
+    partition_info_t *parts = NULL;
+
     pthread_mutex_lock(&g_meta.mutex);
-    int rc = -1;
     const topic_t *t = NULL;
     if (g_meta.ready) {
         t = table_find(&g_meta.table, topic);
-        rc = MB_ERR_UNKNOWN_TOPIC;
     }
-    FILE *f = NULL;
-    if (t != NULL) {
-        rc = -1;
-        f = open_memstream(&text, &len);
+    if (t == NULL) {
+        pthread_mutex_unlock(&g_meta.mutex);
+        return g_meta.ready ? MB_ERR_UNKNOWN_TOPIC : -1;
     }
-    if (f != NULL) {
-        fprintf(f, "topic %s partitions=%d replication=%d retention.bytes=%llu\n", t->name,
-                t->partitions, t->replication, (unsigned long long)t->retention_bytes);
-        for (int p = 0; p < t->partitions; p++) {
-            fprintf(f, "  partition %d leader=%d replicas=", p, t->parts[p].leader);
-            write_replicas(f, &t->parts[p]);
-            if (t->logs != NULL && t->logs[p] != NULL) {
-                fprintf(f, " hwm=%lld leo=%lld", (long long)plog_hwm(t->logs[p]),
-                        (long long)plog_end_offset(t->logs[p]));
-            }
-            fputc('\n', f);
-        }
-        if (fclose(f) == 0) {
-            rc = MB_OK;
-        }
+    snprintf(name, sizeof name, "%s", t->name);
+    partitions = t->partitions;
+    replication = t->replication;
+    retention_bytes = t->retention_bytes;
+    parts = malloc((size_t)partitions * sizeof *parts);
+    if (parts != NULL) {
+        memcpy(parts, t->parts, (size_t)partitions * sizeof *parts);
     }
     pthread_mutex_unlock(&g_meta.mutex);
+
+    if (parts == NULL) {
+        return -1;
+    }
+
+    char *text = NULL;
+    size_t len = 0;
+    FILE *f = open_memstream(&text, &len);
+    if (f == NULL) {
+        free(parts);
+        return -1;
+    }
+
+    fprintf(f, "topic %s partitions=%d replication=%d retention.bytes=%llu\n", name,
+            partitions, replication, (unsigned long long)retention_bytes);
+    for (int p = 0; p < partitions; p++) {
+        fprintf(f, "  partition %d leader=%d replicas=", p, parts[p].leader);
+        write_replicas(f, &parts[p]);
+
+        int isr[META_MAX_REPLICAS];
+        int n_isr = 0;
+        int64_t hwm = -1;
+        int64_t leo = -1;
+        if (repl_partition_state != NULL
+            && repl_partition_state(name, p, isr, &n_isr, &hwm, &leo) == MB_OK) {
+            fprintf(f, " isr=");
+            for (int k = 0; k < n_isr; k++) {
+                if (k > 0) {
+                    fputc(',', f);
+                }
+                fprintf(f, "%d", isr[k]);
+            }
+            fprintf(f, " hwm=%lld leo=%lld", (long long)hwm, (long long)leo);
+        }
+        fputc('\n', f);
+    }
+
+    int rc = (fclose(f) == 0) ? MB_OK : -1;
     if (rc == MB_OK) {
         snprintf(out, size, "%s", text);
     }
     free(text);
+    free(parts);
     return rc;
+}
+
+int meta_get_snapshot(char **out, size_t *len)
+{
+    if (out == NULL || len == NULL) {
+        return -1;
+    }
+    pthread_mutex_lock(&g_meta.mutex);
+    int rc = -1;
+    if (g_meta.ready) {
+        rc = snapshot_build(&g_meta.table, out, len);
+    }
+    pthread_mutex_unlock(&g_meta.mutex);
+    return rc;
+}
+
+int meta_apply_snapshot(const char *text)
+{
+    if (text == NULL) {
+        return -1;
+    }
+    pthread_mutex_lock(&g_meta.mutex);
+    if (!g_meta.ready) {
+        pthread_mutex_unlock(&g_meta.mutex);
+        return -1;
+    }
+
+    table_t new_table;
+    memset(&new_table, 0, sizeof new_table);
+    if (snapshot_parse(text, g_meta.size, &new_table) != 0) {
+        pthread_mutex_unlock(&g_meta.mutex);
+        return -1;
+    }
+
+    if (new_table.version <= g_meta.table.version && g_meta.table.count > 0) {
+        table_free(&new_table);
+        pthread_mutex_unlock(&g_meta.mutex);
+        return MB_OK;
+    }
+
+    for (size_t i = 0; i < new_table.count; i++) {
+        topic_t *nt = &new_table.topics[i];
+        topic_t *ot = table_find(&g_meta.table, nt->name);
+        if (ot != NULL && ot->logs != NULL) {
+            nt->logs = ot->logs;
+            ot->logs = NULL;
+        } else {
+            (void)open_logs(nt, g_meta.dir, g_meta.rank);
+        }
+    }
+
+    table_free(&g_meta.table);
+    g_meta.table = new_table;
+    table_save(&g_meta.table);
+    pthread_mutex_unlock(&g_meta.mutex);
+    return MB_OK;
 }
