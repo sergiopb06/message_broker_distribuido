@@ -18,6 +18,7 @@
 #define MPIL_TAG_READ_REQ     11
 #define MPIL_TAG_META_REQ     12
 #define MPIL_TAG_PRODUCE_REQ  13
+#define MPIL_TAG_FETCH_WAKE   14
 
 typedef void (*mpil_handler_t)(int source, const void *buf, size_t len, void *arg);
 
@@ -33,6 +34,10 @@ int mpil_request(int dest, int tag, const void *req, size_t len,
 // Wakes every thread blocked in mpil_request and makes new requests fail at once.
 // Used by the ordered shutdown so no worker waits for a reply that will never come.
 void mpil_abort_requests(void);
+
+// Waits until every enqueued send has left MPI. Used before the shutdown
+// barrier so no broker finalizes while a peer still has data for it.
+int mpil_drain_sends(int timeout_ms);
 
 int mpil_barrier(void);
 void mpil_shutdown(void);
