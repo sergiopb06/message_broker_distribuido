@@ -1,589 +1,212 @@
 #!/usr/bin/env bash
-# Client-server integration tests: starts pipelined and drives it with pipectl.
-# Run from the repository root (make test does it): bash tests/test_integration.sh
+# Client and consumer-group integration tests against a real cluster of 3 brokers.
+#
+#   bash tests/test_integration.sh            (make test-integration runs it)
+#
+# Covers: the full flow (create, produce, consume, commit, group describe),
+# malformed requests and abrupt disconnects, 60 producers on the same partition,
+# same key -> same partition, rebalancing under load with no partition owned by
+# two members at once, at-least-once delivery when a consumer is killed, the
+# command syntax of the assignment, retention.bytes in the broker, and group
+# commits that survive an orderly restart.
+# Environment: see tests/test_cluster.sh (NP, BASE_PORT, MPIRUN, MPIRUN_ARGS, ...).
 
-SERVER=./bin/pipelined
-CLIENT=./bin/pipectl
-HOST=127.0.0.1
-AGENTS=2
+set -u
 
-CHECKS=0
-FAILURES=0
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
-# Temporary directory for the YAML files, the server's work directory and its output.
-TMP=$(mktemp -d)
-SERVER_PID=""
+NP=${NP:-3}
+TEST_NAME=mb_integration
+# shellcheck source=tests/cluster_lib.sh
+source tests/cluster_lib.sh
 
-cleanup() {
-    if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
-        kill -INT "$SERVER_PID" 2>/dev/null
-        wait "$SERVER_PID" 2>/dev/null
-    fi
-    rm -rf "$TMP"
-}
-trap cleanup EXIT
-
-# check <description> <command...>: runs the command and counts it as passed if it succeeds.
-check() {
-    local description=$1
-    shift
-    CHECKS=$((CHECKS + 1))
-
-    if "$@"; then
-        echo "  ✔ $description"
-        return 0
-    fi
-
-    FAILURES=$((FAILURES + 1))
-    echo "  ✘ FALLA $description"
+# raw <rank> <bytes>: sends exactly those bytes (printf format) on a new connection
+# and prints the first line of the answer, or "closed" if there is none.
+raw() {
+    local rank=$1 payload=$2 line=""
+    exec 7<>"/dev/tcp/$(host_of "$rank")/$((BASE_PORT + rank))" || { echo "noconnect"; return; }
+    # shellcheck disable=SC2059
+    printf "$payload" >&7 2>/dev/null
+    if IFS= read -r -t 5 line <&7; then echo "$line"; else echo "closed"; fi
+    exec 7>&-
 }
 
-# Compare float: compare_floats val1 op val2
-compare_floats() {
-    awk -v v1="$1" -v op="$2" -v v2="$3" 'BEGIN {
-        if (op == ">=") exit !(v1 + 0 >= v2 + 0)
-        if (op == "<=") exit !(v1 + 0 <= v2 + 0)
-        exit 1
-    }'
+# Prefixes every line with the time it was read (bash builtin, no process per line).
+stamp() {
+    local line
+    while IFS= read -r line; do printf '%s %s\n' "$EPOCHREALTIME" "$line"; done
 }
 
-# Calculate elapsed: calc_elapsed end start
-calc_elapsed() {
-    awk -v end="$1" -v start="$2" 'BEGIN {print end - start}'
-}
+echo "═══ test_integration · $NP brokers with $MPIRUN, ports $BASE_PORT-$((BASE_PORT + NP - 1))"
 
-# client <args...>: runs pipectl against the test server; output goes to $TMP/out.
-client() {
-    "$CLIENT" "$HOST" "$PORT" "$@" > "$TMP/out" 2>&1
-}
-
-# Status of a run, the 4th word of the first STATUS line: run <id> "<name>" <status> <time>
-run_status() {
-    "$CLIENT" "$HOST" "$PORT" STATUS "$1" 2>/dev/null | head -1 | awk '{print $4}'
-}
-
-# wait_finished <id> <seconds>: waits until the run is no longer queued or running.
-wait_finished() {
-    local tries=$(($2 * 10))
-    local i
-
-    for ((i = 0; i < tries; i++)); do
-        case $(run_status "$1") in
-            queued|running|"") sleep 0.1 ;;
-            *) return 0 ;;
-        esac
-    done
-
-    return 1
-}
-
-# wait_status <id> <status> <seconds>: waits until the run status matches the target status.
-wait_status() {
-    local id=$1
-    local target=$2
-    local timeout=$3
-    local tries=$(($timeout * 10))
-    for ((i = 0; i < tries; i++)); do
-        if [ "$(run_status "$id")" = "$target" ]; then
-            return 0
-        fi
-        sleep 0.1
-    done
-    return 1
-}
-
-out_has() { grep -qF -- "$1" "$TMP/out"; }
-out_lines() { wc -l < "$TMP/out"; }
-
-# no_orphan <pattern>: passes when no process matches the pattern.
-no_orphan() {
-    if pgrep -f "$1" > /dev/null; then
-        return 1
-    fi
-    return 0
-}
-
-
-
-# A free-looking port, so the tests don't clash with a server already running.
-PORT=$((20000 + RANDOM % 20000))
-mkdir -p "$TMP/work"
-
-"$SERVER" "$PORT" "$AGENTS" "$TMP/work" > "$TMP/server.log" 2>&1 &
-SERVER_PID=$!
-
-for ((i = 0; i < 50; i++)); do
-    if "$CLIENT" "$HOST" "$PORT" LIST > /dev/null 2>&1; then
-        break
-    fi
-    sleep 0.1
-done
-
-if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "integration: the server didn't start"
-    cat "$TMP/server.log"
+section "arranque" "clúster de $NP brokers"
+check "los $NP brokers responden" start_cluster
+if [ -z "$MPI_PID" ] || ! kill -0 "$MPI_PID" 2>/dev/null; then
+    echo "the cluster did not start; log:"
+    cat "$BROKER_LOG"
     exit 1
 fi
 
-cp tests/cancel_task.yaml "$TMP/cancel_task.yaml"
-cp tests/publish_fail.yaml "$TMP/publish_fail.yaml"
+# --------------------------------------------------------------------------
+section "flujo completo" "crear, producir, consumir, confirmar y describir el grupo"
+cli 0 TOPIC CREATE flow 3 2 > "$WORK/create.out" 2>&1
+check "topic create" grep -q "topic created" "$WORK/create.out"
+check "topic list lo muestra en otro broker" wait_until 5 bash -c "timeout 5 $CLI $(host_of 2) $((BASE_PORT + 2)) TOPIC LIST | grep -q '^flow '"
+seq 1 30 | sed 's/^/flow-/' | produce 1 flow ALL - > "$WORK/flow.out" 2>&1
+check "30 mensajes sin clave confirmados con acks=all" [ "$(grep -c offset= "$WORK/flow.out")" -eq 30 ]
+check "sin clave se reparten en las 3 particiones" [ "$(cut -d' ' -f1 "$WORK/flow.out" | sort -u | wc -l)" -eq 3 ]
+consume 2 flow billing 3 > "$WORK/flow_consumed.out"
+check "el consumidor recibe los 30, cada uno una vez" [ "$(grep -o 'flow-[0-9]*' "$WORK/flow_consumed.out" | sort -u | wc -l)" -eq 30 ]
+cli 0 GROUP DESCRIBE billing > "$WORK/describe.out" 2>&1
+lag_zero() { [ "$(grep -c 'lag 0$' "$WORK/describe.out")" -eq 3 ]; }
+check "group describe: offsets confirmados y lag 0 en las 3 particiones" lag_zero
+cli 1 GROUP DESCRIBE billing > "$WORK/describe1.out" 2>&1
+check "group describe da lo mismo desde otro broker" cmp -s "$WORK/describe.out" "$WORK/describe1.out"
 
+# --------------------------------------------------------------------------
+section "solicitudes mal formadas" "ningún broker se cae ni deja de atender"
+check "comando desconocido → ERR" [ "$(raw 0 'HELLO world\n' | cut -d' ' -f1)" = ERR ]
+check "PRODUCE con argumentos de menos → ERR" [ "$(raw 1 'PRODUCE flow 1 0\n' | cut -d' ' -f1)" = ERR ]
+check "acks inválido → ERR" [ "$(raw 2 'PRODUCE flow 7 0 5\nhello' | cut -d' ' -f1)" = ERR ]
+check "valor más grande que el máximo → ERR" [ "$(raw 0 'PRODUCE flow 1 0 999999999\n' | cut -d' ' -f1)" = ERR ]
+check "clave más grande que el máximo → ERR" [ "$(raw 0 'PRODUCE flow 1 99999 5\n' | cut -d' ' -f1)" = ERR ]
+check "tópico inexistente → ERR" [ "$(raw 1 'PRODUCE nosuchtopic 1 0 5\nhello' | cut -d' ' -f1)" = ERR ]
+long=$(printf 'x%.0s' $(seq 1 700))
+check "línea más larga que el límite → ERR" [ "$(raw 2 "TOPIC DESCRIBE $long\n" | cut -d' ' -f1)" = ERR ]
+check "COMMIT de un miembro que no existe → ERR" [ "$(raw 0 'COMMIT flow billing 99 0 5\n' | cut -d' ' -f1)" = ERR ]
+check "bytes binarios → ERR o cierre" bash -c "r=\$(exec 7<>/dev/tcp/$(host_of 1)/$((BASE_PORT + 1)); printf '\\x01\\xff\\xfe\\n' >&7; read -r -t 5 l <&7 && echo \"\$l\" || echo closed); [ \"\${r%% *}\" = ERR ] || [ \"\$r\" = closed ]"
+# Abrupt disconnects: a body cut in the middle, and connections closed at once.
+for r in 0 1 2; do
+    port=$((BASE_PORT + r))
+    (exec 7<>"/dev/tcp/$(host_of "$r")/$port"; printf 'PRODUCE flow 1 0 100\n0123456789' >&7) 2>/dev/null
+    for _ in $(seq 10); do (exec 7<>"/dev/tcp/$(host_of "$r")/$port") 2>/dev/null; done
+done
+check "los $NP brokers siguen respondiendo" all_answer
+echo "still-works" | produce 0 flow 1 - > "$WORK/after_garbage.out" 2>&1
+check "y siguen aceptando mensajes" grep -q offset= "$WORK/after_garbage.out"
+check "el proceso del clúster sigue vivo" kill -0 "$MPI_PID"
 
+# --------------------------------------------------------------------------
+section "estrés" "60 productores a la vez sobre la misma partición"
+cli 0 TOPIC CREATE stress 3 2 >/dev/null 2>&1
+wait_until 5 bash -c "timeout 5 $CLI $(host_of 2) $((BASE_PORT + 2)) TOPIC DESCRIBE stress | grep -q leader="
+pids=()
+for i in $(seq 1 60); do
+    seq 1 20 | sed "s/^/stress-$i-/" | produce $((i % NP)) stress 1 samekey > "$WORK/stress.$i" 2>&1 &
+    pids+=($!)
+done
+for pid in "${pids[@]}"; do wait "$pid"; done
+cat "$WORK"/stress.* > "$WORK/stress.all"
+check "1200 confirmaciones" [ "$(grep -c offset= "$WORK/stress.all")" -eq 1200 ]
+check "todas en la misma partición" [ "$(cut -d' ' -f1 "$WORK/stress.all" | sort -u | wc -l)" -eq 1 ]
+sed 's/.*offset=//' "$WORK/stress.all" | sort -n > "$WORK/stress.offsets"
+check "offsets únicos y sin huecos (0..1199)" [ "$(tr '\n' ' ' < "$WORK/stress.offsets")" = "$(seq 0 1199 | tr '\n' ' ')" ]
 
+# --------------------------------------------------------------------------
+section "particionado por clave" "misma clave → misma partición, desde cualquier broker"
+same_partition_ok=1
+expected_ok=1
+for k in $(seq 1 10); do
+    key="customer$k"
+    for r in 0 1 2; do echo "$key-$r" | produce "$r" flow 1 "$key"; done > "$WORK/key.$k" 2>&1
+    [ "$(cut -d' ' -f1 "$WORK/key.$k" | sort -u | wc -l)" -eq 1 ] || same_partition_ok=0
+    [ "$(head -n 1 "$WORK/key.$k" | cut -d' ' -f1)" = "partition=$(( $(fnv1a "$key") % 3 ))" ] || expected_ok=0
+done
+check "10 claves: cada una siempre cae en la misma partición" [ "$same_partition_ok" -eq 1 ]
+check "y es FNV-1a(clave) mod P" [ "$expected_ok" -eq 1 ]
 
-
-
-cat > "$TMP/invalid.yaml" <<'YAML'
-trigger: main
-stages:
-- stage: build
-  jobs:
-  - job: a
-    dependsOn: b
-    steps: [{script: echo a}]
-  - job: b
-    dependsOn: a
-    steps: [{script: echo b}]
-- stage: build
-  dependsOn: tset
-  jobs: [{job: c, steps: [{script: echo c}]}]
-YAML
-
-cat > "$TMP/valid.yaml" <<'YAML'
-name: integration
-variables:
-  WHO: world
-stages:
-- stage: build
-  jobs:
-  - job: hello
-    steps:
-    - script: echo "hello $(WHO)"
-- stage: test
-  jobs:
-  - job: check
-    steps:
-    - script: echo "second stage"
-YAML
-
-cat > "$TMP/slow.yaml" <<'YAML'
-stages:
-- stage: s
-  jobs:
-  - job: forever
-    steps:
-    - script: sleep 30
-YAML
-
-cat > "$TMP/agents.yaml" <<'YAML'
-stages:
-- stage: wide
-  jobs:
-  - {job: a, steps: [{task: Sleep@1, inputs: {seconds: 1}}]}
-  - {job: b, steps: [{task: Sleep@1, inputs: {seconds: 1}}]}
-  - {job: c, steps: [{task: Sleep@1, inputs: {seconds: 1}}]}
-  - {job: d, steps: [{task: Sleep@1, inputs: {seconds: 1}}]}
-YAML
-
-
-
-echo "malformed requests"
-
-client FOO
-check "unknown command exits with 1" [ $? -eq 1 ]
-check "unknown command reason" out_has "unknown command"
-
-client STATUS abc
-check "invalid id exits with 1" [ $? -eq 1 ]
-check "invalid id reason" out_has "invalid id"
-
-client STATUS 999
-check "unknown run reason" out_has "run 999 not found"
-
-
-
-echo "invalid pipeline"
-
-client SUBMIT "$TMP/invalid.yaml"
-check "invalid pipeline exits with 1" [ $? -eq 1 ]
-check "unknown key reported" out_has "unknown key 'trigger'"
-check "duplicate stage reported" out_has "duplicate stage name 'build'"
-check "cycle reported" out_has "dependency cycle"
-check "unknown stage reported" out_has "unknown stage 'tset'"
-check "all 4 errors in one answer" [ "$(out_lines)" -eq 4 ]
-
-
-
-
-
-
-echo "valid pipeline"
-
-client SUBMIT "$TMP/valid.yaml"
-check "valid pipeline accepted" [ $? -eq 0 ]
-VALID_ID=$(cat "$TMP/out")
-
-check "valid run finishes" wait_finished "$VALID_ID" 10
-check "valid run succeeded" [ "$(run_status "$VALID_ID")" = "succeeded" ]
-
-client LOGS "$VALID_ID"
-check "logs have the script output" out_has "hello world"
-check "logs have the second stage" out_has "second stage"
-check "logs have a header per job" out_has "== build/hello =="
-
-client LOGS "$VALID_ID" check
-check "logs of one job" out_has "second stage"
-check "logs of one job only" [ "$(grep -c "hello world" "$TMP/out")" -eq 0 ]
-
-client LIST
-check "list shows the run" out_has "integration succeeded"
-
-
-
-echo "logs --follow"
-
-client SUBMIT "$TMP/valid.yaml"
-FOLLOW_ID=$(cat "$TMP/out")
-
-timeout 10 "$CLIENT" "$HOST" "$PORT" LOGS "$FOLLOW_ID" FOLLOW > "$TMP/out" 2>&1
-check "follow ends when the run ends" [ $? -eq 0 ]
-check "follow received the lines" out_has "second stage"
-
-
-
-echo "cancel"
-
-client SUBMIT "$TMP/slow.yaml"
-SLOW_ID=$(cat "$TMP/out")
+# --------------------------------------------------------------------------
+section "rebalanceo bajo carga" "entran y salen miembros mientras se produce; al menos una vez"
+cli 0 TOPIC CREATE orders 4 2 >/dev/null 2>&1
+wait_until 5 bash -c "timeout 5 $CLI $(host_of 2) $((BASE_PORT + 2)) TOPIC DESCRIBE orders | grep -q leader="
+GROUP=shipping
+# Steady load for about 12 s: one message every 10 ms.
+(for i in $(seq 1 1200); do echo "order-$i"; sleep 0.01; done) | produce 0 orders 1 - > "$WORK/orders.produced" 2>&1 &
+PRODUCER=$!
+start_member() { # start_member <name> <rank>
+    "$CLI" "$(host_of "$2")" $((BASE_PORT + $2)) CONSUME orders "$GROUP" FROM_BEGINNING \
+        > >(stamp > "$WORK/member.$1") 2>/dev/null &
+    eval "PID_$1=\$!"
+}
+start_member A 0
+sleep 2
+start_member B 1
+sleep 2
+start_member C 2
+sleep 2
+# shellcheck disable=SC2154
+{ kill -KILL "$PID_A"; wait "$PID_A"; } 2>/dev/null   # dies without LEAVE or its last commit
+wait "$PRODUCER"
+sleep 4               # B and C drain what is left
+cli 1 GROUP DESCRIBE "$GROUP" > "$WORK/orders.describe" 2>&1
+# shellcheck disable=SC2154
+kill -TERM "$PID_B" "$PID_C" 2>/dev/null
+wait "$PID_B" "$PID_C" 2>/dev/null
 sleep 0.5
 
-client CANCEL "$SLOW_ID"
-check "cancel accepted" out_has "canceling"
-check "canceled run finishes quickly" wait_finished "$SLOW_ID" 5
-check "run is canceled" [ "$(run_status "$SLOW_ID")" = "canceled" ]
-
-
-
-
-
-echo "agent limit"
-
-# 4 jobs of 1 second with 2 agents: at most 2 at a time, so about 2 seconds, never about 1.
-START=$(date +%s.%N)
-client SUBMIT "$TMP/agents.yaml"
-AGENTS_ID=$(cat "$TMP/out")
-check "wide run finishes" wait_finished "$AGENTS_ID" 10
-END=$(date +%s.%N)
-
-ELAPSED=$(calc_elapsed "$END" "$START")
-check "never more jobs than agents (took ${ELAPSED}s)" compare_floats "$ELAPSED" ">=" "1.9"
-
-
-
-# ---------- job timeout ----------
-
-echo "job timeout"
-
-cat > "$TMP/timeout_works.yaml" <<'YAML'
-name: timeout_works
-stages:
-- stage: s
-  jobs:
-  - job: naps
-    timeoutInSeconds: 2
-    steps:
-    - script: sleep 1.5
-YAML
-
-cat > "$TMP/timeout_sleep_task.yaml" <<'YAML'
-name: timeout_sleep_task
-stages:
-- stage: s
-  jobs:
-  - job: sleeper
-    timeoutInSeconds: 2
-    steps:
-    - task: Sleep@1
-      inputs: {seconds: 10}
-YAML
-
-cat > "$TMP/timeout_total.yaml" <<'YAML'
-name: timeout_total
-stages:
-- stage: s
-  jobs:
-  - job: three_naps
-    timeoutInSeconds: 2
-    steps:
-    - script: sleep 0.8
-    - script: sleep 0.8
-    - script: sleep 0.8
-YAML
-
-client SUBMIT "$TMP/timeout_works.yaml"
-check "under the limit accepted" [ $? -eq 0 ]
-WORKS_ID=$(cat "$TMP/out")
-check "under the limit finishes" wait_finished "$WORKS_ID" 10
-check "under the limit succeeded" [ "$(run_status "$WORKS_ID")" = "succeeded" ]
-
-client SUBMIT "$TMP/timeout_sleep_task.yaml"
-check "sleep task accepted" [ $? -eq 0 ]
-TASK_ID=$(cat "$TMP/out")
-START=$(date +%s.%N)
-check "sleep task finishes" wait_finished "$TASK_ID" 10
-END=$(date +%s.%N)
-ELAPSED=$(calc_elapsed "$END" "$START")
-check "sleep task timeout stops it early (${ELAPSED}s)" compare_floats "$ELAPSED" "<=" "5"
-check "sleep task run failed" [ "$(run_status "$TASK_ID")" = "failed" ]
-client LOGS "$TASK_ID" sleeper
-check "sleep task logged the timeout" out_has "##[error] Timeout exceeded."
-
-client SUBMIT "$TMP/timeout_total.yaml"
-check "total timeout accepted" [ $? -eq 0 ]
-TOTAL_ID=$(cat "$TMP/out")
-check "total timeout finishes" wait_finished "$TOTAL_ID" 10
-check "total timeout run failed" [ "$(run_status "$TOTAL_ID")" = "failed" ]
-client LOGS "$TOTAL_ID"
-check "total timeout logged" out_has "##[error] Timeout exceeded."
-
-
-
-# ---------- background children die with the step ----------
-
-echo "background children"
-
-cat > "$TMP/background.yaml" <<'YAML'
-name: background
-stages:
-- stage: s
-  jobs:
-  - job: bg
-    steps:
-    - script: sleep 5.4321 & echo "spawned"
-YAML
-
-START=$(date +%s.%N)
-client SUBMIT "$TMP/background.yaml"
-check "background accepted" [ $? -eq 0 ]
-BG_ID=$(cat "$TMP/out")
-check "background finishes quickly" wait_finished "$BG_ID" 5
-END=$(date +%s.%N)
-ELAPSED=$(calc_elapsed "$END" "$START")
-check "background step doesn't wait for its child (${ELAPSED}s)" compare_floats "$ELAPSED" "<=" "3"
-check "no orphan child survives" no_orphan "sleep 5.4321"
-
-
-
-# ---------- artifacts with spaces and apostrophes ----------
-
-echo "artifact names with spaces and quotes"
-
-cat > "$TMP/spaces.yaml" <<'YAML'
-name: spaces
-stages:
-- stage: s
-  jobs:
-  - job: j
-    steps:
-    - script: mkdir -p "my dir/weird 'name" && echo "contenido secreto" > "my dir/weird 'name/text file 'x'.txt"
-    - publish: my dir/weird 'name
-      artifact: artifact 'con' espacios
-    - download: artifact 'con' espacios
-      path: dest 'in' spaces
-    - script: cat "dest 'in' spaces/weird 'name/text file 'x'.txt" | grep "contenido secreto" && echo "SPACES_OK"
-YAML
-
-client SUBMIT "$TMP/spaces.yaml"
-check "spaces accepted" [ $? -eq 0 ]
-SPACES_ID=$(cat "$TMP/out")
-check "spaces finishes" wait_finished "$SPACES_ID" 10
-check "spaces succeeds" [ "$(run_status "$SPACES_ID")" = "succeeded" ]
-client LOGS "$SPACES_ID"
-check "spaces downloaded correctly" out_has "SPACES_OK"
-
-
-
-# ---------- unknown task ----------
-
-echo "unknown task"
-
-cat > "$TMP/unknown_task.yaml" <<'YAML'
-name: unknown_task
-stages:
-- stage: s
-  jobs:
-  - job: j
-    steps:
-    - task: Nope@9
-      inputs: {seconds: 1}
-YAML
-
-client SUBMIT "$TMP/unknown_task.yaml"
-check "unknown task rejected" [ $? -eq 1 ]
-check "unknown task reported" out_has "unknown task 'Nope@9'"
-
-
-
-# ---------- workspace isolation ----------
-
-echo "workspace isolation"
-
-cat > "$TMP/isolation.yaml" <<'YAML'
-name: isolation
-stages:
-- stage: leave
-  jobs:
-  - job: writer
-    steps:
-    - script: echo "archivo privado" > left.txt
-- stage: check
-  jobs:
-  - job: checker
-    steps:
-    - script: "test ! -f left.txt && echo ISOLATED_OK"
-YAML
-
-client SUBMIT "$TMP/isolation.yaml"
-check "isolation accepted" [ $? -eq 0 ]
-ISO_ID=$(cat "$TMP/out")
-check "isolation finishes" wait_finished "$ISO_ID" 10
-check "isolation succeeds" [ "$(run_status "$ISO_ID")" = "succeeded" ]
-client LOGS "$ISO_ID"
-check "workspaces don't share files" out_has "ISOLATED_OK"
-
-
-
-# ---------- wordcount with 1 and N threads ----------
-
-echo "wordcount threads determinism"
-
-cat > "$TMP/wc_threads.yaml" <<'YAML'
-name: wc_threads
-stages:
-- stage: prep
-  jobs:
-  - job: corpus
-    steps:
-    - script: seq 200 | awk '{print $0 " hola mundo texto repetido"}' > corpus.txt && echo "ha" >> corpus.txt
-    - publish: corpus.txt
-      artifact: corpus
-- stage: count
-  jobs:
-  - job: one
-    steps:
-    - download: corpus
-      path: .
-    - task: WordCount@1
-      inputs: {file: corpus.txt, threads: 1, output: out1.txt, top: 5}
-    - publish: out1.txt
-      artifact: out1
-  - job: many
-    steps:
-    - download: corpus
-      path: .
-    - task: WordCount@1
-      inputs: {file: corpus.txt, threads: 8, output: out8.txt, top: 5}
-    - publish: out8.txt
-      artifact: out8
-- stage: compare
-  jobs:
-  - job: cmp
-    steps:
-    - download: out1
-      path: a
-    - download: out8
-      path: b
-    - script: diff a/out1.txt b/out8.txt && echo "WC_THREADS_MATCH"
-YAML
-
-client SUBMIT "$TMP/wc_threads.yaml"
-check "wordcount threads accepted" [ $? -eq 0 ]
-WC_ID=$(cat "$TMP/out")
-check "wordcount threads finishes" wait_finished "$WC_ID" 20
-check "wordcount threads succeeds" [ "$(run_status "$WC_ID")" = "succeeded" ]
-client LOGS "$WC_ID"
-check "1 thread equals N threads" out_has "WC_THREADS_MATCH"
-
-
-
-# ---------- continueOnError ----------
-
-echo "continueOnError"
-client SUBMIT tests/continue_on_error.yaml
-check "continueOnError accepted" [ $? -eq 0 ]
-CONT_ID=$(cat "$TMP/out")
-check "continueOnError finishes" wait_finished "$CONT_ID" 10
-check "continueOnError partially succeeds" [ "$(run_status "$CONT_ID")" = "partiallySucceeded" ]
-
-
-
-# ---------- publish fail ----------
-
-echo "publish fail"
-
-client SUBMIT "$TMP/publish_fail.yaml"
-check "publish fail accepted" [ $? -eq 0 ]
-FAIL_ID=$(cat "$TMP/out")
-check "publish fail run finishes" wait_finished "$FAIL_ID" 10
-check "publish fail run failed" [ "$(run_status "$FAIL_ID")" = "failed" ]
-client LOGS "$FAIL_ID"
-check "logs have the error" out_has "##[error] publish failed."
-
-
-# ---------- cancel data task ----------
-
-echo "cancel data task"
-client SUBMIT "$TMP/cancel_task.yaml"
-CANCEL_ID=$(cat "$TMP/out")
-# Wait until running
-check "cancel task starts" wait_status "$CANCEL_ID" "running" 5
-client CANCEL "$CANCEL_ID"
-check "cancel accepted" out_has "canceling"
-check "canceled run finishes" wait_status "$CANCEL_ID" "canceled" 5
-
-
-# ---------- concurrent clients ----------
-
-echo "concurrent clients"
-
-# Wait only for the clients: a bare wait would also wait for the server, which never ends.
-PIDS=()
-for ((i = 0; i < 50; i++)); do
-    "$CLIENT" "$HOST" "$PORT" LIST > "$TMP/list_$i" 2>&1 &
-    PIDS+=($!)
-done
-for ((i = 0; i < ${#PIDS[@]}; i++)); do
-    wait "${PIDS[$i]}"
-done
-
-ANSWERED=0
-for ((i = 0; i < 50; i++)); do
-    if grep -q "integration" "$TMP/list_$i"; then
-        ANSWERED=$((ANSWERED + 1))
-    fi
-done
-check "50 concurrent clients answered ($ANSWERED)" [ "$ANSWERED" -eq 50 ]
-
-
-
-echo "shutdown"
-
-client SHUTDOWN
-check "shutdown accepted" out_has "shutting down"
-
-for ((i = 0; i < 50; i++)); do
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        break
-    fi
-    sleep 0.2
-done
-
-check "server exited" [ "$(kill -0 "$SERVER_PID" 2>/dev/null; echo $?)" -ne 0 ]
-
-client LIST
-check "no connections after shutdown" [ $? -ne 0 ]
-
-
-echo
-echo "✔ integration — servidor real + cliente en vivo: $((CHECKS - FAILURES)) de $CHECKS checks pasaron$([ "$FAILURES" -eq 0 ] && echo ' — todo verde')"
-[ "$FAILURES" -eq 0 ]
+grep -o 'partition=[0-9]* offset=[0-9]*' "$WORK/orders.produced" | sort -u > "$WORK/orders.confirmed"
+cat "$WORK"/member.? | grep -o 'partition=[0-9]* offset=[0-9]*' | sort -u > "$WORK/orders.delivered"
+check "1200 mensajes confirmados" [ "$(wc -l < "$WORK/orders.confirmed")" -eq 1200 ]
+check "al menos una vez: cada confirmado llegó a algún miembro" bash -c "[ -z \"\$(comm -23 '$WORK/orders.confirmed' '$WORK/orders.delivered')\" ]"
+check "el miembro eliminado recibió mensajes antes de morir" [ -s "$WORK/member.A" ]
+check "los dos que quedan comparten las 4 particiones" bash -c "[ \$(grep -c '^  partition' '$WORK/orders.describe') -eq 4 ] && [ \$(grep '^  partition' '$WORK/orders.describe' | awk '{print \$4}' | sort -u | grep -vc '^-$') -eq 2 ]"
+check "y quedaron al día (lag 0)" [ "$(grep -c 'lag 0$' "$WORK/orders.describe")" -eq 4 ]
+# Exclusive ownership: merge every delivery by the time it was read and count, per
+# partition, how often the receiving member changes. Each membership change (A, B
+# and C joining, A dying) can move a partition once; two owners at the same time
+# would interleave their deliveries and switch members on almost every batch.
+switches=$(for m in A B C; do sed -n "s/^\([0-9.]*\) partition=\([0-9]*\) .*/\1 \2 $m/p" "$WORK/member.$m"; done \
+    | sort -n | awk '{ if (($2 in last) && last[$2] != $3) n[$2]++; last[$2] = $3 }
+                     END { m = 0; for (p in n) if (n[p] > m) m = n[p]; print m + 0 }')
+check "ninguna partición con dos dueños a la vez (cambios de dueño por partición: $switches ≤ 4)" [ "$switches" -le 4 ]
+
+# --------------------------------------------------------------------------
+section "sintaxis del enunciado" "mbcli host:port con comandos en minúscula y opciones -p -r -k --acks -g --from-beginning"
+ADDR1="$(host_of 1):$((BASE_PORT + 1))"
+ADDR2="$(host_of 2):$((BASE_PORT + 2))"
+timeout 20 "$CLI" "$ADDR1" topic create pedidos -p 3 -r 2 > "$WORK/spec_create.out" 2>&1
+check "topic create <t> -p 3 -r 2" grep -q "topic created" "$WORK/spec_create.out"
+check "topic describe <t> muestra las 3 particiones" wait_until 5 bash -c "[ \$(timeout 5 $CLI $ADDR2 topic describe pedidos | grep -c '^  partition .* leader=') -eq 3 ]"
+printf 'pedido 1\npedido 2\n' | timeout 30 "$CLI" "$ADDR2" produce pedidos -k cliente42 --acks all > "$WORK/spec_produce.out" 2>&1
+check "produce -k cliente42 --acks all confirma 2 mensajes en la misma partición" \
+    bash -c "[ \$(grep -c offset= '$WORK/spec_produce.out') -eq 2 ] && [ \$(cut -d' ' -f1 '$WORK/spec_produce.out' | sort -u | wc -l) -eq 1 ]"
+timeout 4 "$CLI" "$ADDR1" consume pedidos -g facturacion --from-beginning > "$WORK/spec_consume.out" 2>/dev/null
+check "consume -g --from-beginning recibe los 2" [ "$(grep -c 'pedido [12]$' "$WORK/spec_consume.out")" -eq 2 ]
+timeout 10 "$CLI" "$ADDR2" group describe facturacion > "$WORK/spec_group.out" 2>&1
+check "group describe muestra el commit (lag 0 en su partición)" grep -q "committed 2 lag 0$" "$WORK/spec_group.out"
+check "una opción desconocida es un error de uso" bash -c "! timeout 5 $CLI $ADDR1 produce pedidos --nope 1 </dev/null >/dev/null 2>&1"
+
+# --------------------------------------------------------------------------
+section "retención" "retention.bytes en el broker: se borran los mensajes viejos y los offsets no se reutilizan"
+cli 0 TOPIC CREATE ret 1 2 16384 > "$WORK/ret_create.out" 2>&1
+check "topic create con retention.bytes = 16384" grep -q "topic created" "$WORK/ret_create.out"
+value=$(printf '%0100d' 0)
+seq 0 599 | sed "s/^/ret-/; s/\$/-$value/" | produce 1 ret 1 - > "$WORK/ret.out" 2>&1
+check "600 mensajes de ~110 B confirmados (offsets 0..599)" offsets_contiguous "$WORK/ret.out" 0 0 600
+consume 2 ret retgroup 4 > "$WORK/ret_consumed.out"
+ret_first=$(sed -n '1s/.*offset=\([0-9]*\) .*/\1/p' "$WORK/ret_consumed.out")
+check "los primeros offsets ya no existen (el primero disponible es ${ret_first:-?} > 0)" [ "${ret_first:-0}" -gt 0 ]
+check "y se lee del primero disponible al último sin huecos" \
+    [ "$(sed -n 's/.*offset=\([0-9]*\) .*/\1/p' "$WORK/ret_consumed.out" | tr '\n' ' ')" = "$(seq "${ret_first:-0}" 599 | tr '\n' ' ')" ]
+echo "ret-after" | produce 0 ret 1 - > "$WORK/ret_after.out" 2>&1
+check "el siguiente offset es 600: no se reutilizan" grep -q "offset=600$" "$WORK/ret_after.out"
+
+# --------------------------------------------------------------------------
+section "persistencia de commits" "tras apagar y reiniciar, el grupo conserva sus offsets confirmados"
+cli 0 GROUP DESCRIBE billing | grep '^  partition' | awk '{print $2, $6}' > "$WORK/commits_before.out"
+check "hay commits antes del reinicio" [ "$(wc -l < "$WORK/commits_before.out")" -eq 3 ]
+check "shutdown ordenado" stop_cluster 0
+check "el clúster arranca de nuevo sobre los mismos datos" start_cluster
+check "group describe da los mismos offsets confirmados" \
+    wait_until 10 bash -c "cmp -s '$WORK/commits_before.out' <(timeout 5 $CLI $(host_of 1) $((BASE_PORT + 1)) GROUP DESCRIBE billing | grep '^  partition' | awk '{print \$2, \$6}')"
+seq 1 3 | sed 's/^/flow-new-/' | produce 0 flow ALL - > /dev/null 2>&1
+consume 1 flow billing 4 > "$WORK/billing_after.out"
+check "el grupo sigue desde sus commits: solo recibe los 3 nuevos" \
+    bash -c "[ \$(grep -c 'flow-new-' '$WORK/billing_after.out') -eq 3 ] && ! grep -q 'flow-[0-9]' '$WORK/billing_after.out'"
+
+# --------------------------------------------------------------------------
+section "apagado" "shutdown ordenado del clúster"
+check "shutdown termina el clúster" stop_cluster 1
+check "mpirun sale con código 0" [ "$STOP_RC" -eq 0 ]
+
+summary test_integration
