@@ -9,7 +9,7 @@ CFLAGS += -DSIN_PROTECCION
 endif
 
 OBJS_STORAGE = $(BUILD)/log.o $(BUILD)/fsutil.o
-OBJS_CLUSTER = $(BUILD)/metadata.o $(BUILD)/mpi_layer.o $(BUILD)/replication.o
+OBJS_CLUSTER = $(BUILD)/metadata.o $(BUILD)/mpi_layer.o $(BUILD)/replication.o $(BUILD)/job_queue.o
 OBJS_NET     = $(BUILD)/net_util.o $(BUILD)/protocol.o
 OBJS_CLIENT  = $(BUILD)/client.o $(OBJS_NET)
 

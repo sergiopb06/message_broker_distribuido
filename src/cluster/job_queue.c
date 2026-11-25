@@ -2,99 +2,86 @@
 
 #include "job_queue.h"
 
-#include <errno.h>
 #include <stdlib.h>
 
-int job_queue_init(job_queue_t *queue)
+int job_queue_init(job_queue_t *queue, size_t capacity)
 {
-    queue->head = NULL;
-    queue->tail = NULL;
-    queue->size = 0;
-    queue->closed = false;
-    if (sem_init(&queue->items, 0, 0) < 0) {
+    if (queue == NULL || capacity == 0) {
         return -1;
     }
-    omp_init_lock(&queue->lock);
+    queue->items = calloc(capacity, sizeof *queue->items);
+    if (queue->items == NULL) {
+        return -1;
+    }
+    queue->capacity = capacity;
+    queue->head = 0;
+    queue->count = 0;
+    queue->closed = false;
+    if (pthread_mutex_init(&queue->mutex, NULL) != 0) {
+        free(queue->items);
+        return -1;
+    }
+    if (pthread_cond_init(&queue->not_empty, NULL) != 0) {
+        pthread_mutex_destroy(&queue->mutex);
+        free(queue->items);
+        return -1;
+    }
     return 0;
 }
 
 void job_queue_destroy(job_queue_t *queue)
 {
-    job_node_t *node = queue->head;
-    while (node != NULL) {
-        job_node_t *next = node->next;
-        free(node);
-        node = next;
+    if (queue == NULL || queue->items == NULL) {
+        return;
     }
-    queue->head = NULL;
-    queue->tail = NULL;
-    omp_destroy_lock(&queue->lock);
-    sem_destroy(&queue->items);
+    pthread_cond_destroy(&queue->not_empty);
+    pthread_mutex_destroy(&queue->mutex);
+    free(queue->items);
+    queue->items = NULL;
 }
 
-int job_queue_push(job_queue_t *queue, run_t *run, size_t job)
+int job_queue_push(job_queue_t *queue, void *item)
 {
-    job_node_t *node = malloc(sizeof *node);
-    if (node == NULL) {
+    pthread_mutex_lock(&queue->mutex);
+    if (queue->closed || queue->count == queue->capacity) {
+        pthread_mutex_unlock(&queue->mutex);
         return -1;
     }
-    node->run = run;
-    node->job = job;
-    node->next = NULL;
-
-    omp_set_lock(&queue->lock);
-    if (queue->tail == NULL) {
-        queue->head = node;
-    } else {
-        queue->tail->next = node;
-    }
-    queue->tail = node;
-    queue->size++;
-    omp_unset_lock(&queue->lock);
-
-    sem_post(&queue->items);
+    queue->items[(queue->head + queue->count) % queue->capacity] = item;
+    queue->count++;
+    pthread_cond_signal(&queue->not_empty);
+    pthread_mutex_unlock(&queue->mutex);
     return 0;
 }
 
-bool job_queue_pop(job_queue_t *queue, run_t **run, size_t *job)
+void *job_queue_pop(job_queue_t *queue)
 {
-    while (sem_wait(&queue->items) < 0 && errno == EINTR) {
+    pthread_mutex_lock(&queue->mutex);
+    while (queue->count == 0 && !queue->closed) {
+        pthread_cond_wait(&queue->not_empty, &queue->mutex);
     }
-
-    omp_set_lock(&queue->lock);
-    job_node_t *node = queue->head;
-    if (node == NULL) {
-        omp_unset_lock(&queue->lock);
-        return false;
+    void *item = NULL;
+    if (queue->count > 0) {
+        item = queue->items[queue->head];
+        queue->head = (queue->head + 1) % queue->capacity;
+        queue->count--;
     }
-    queue->head = node->next;
-    if (queue->head == NULL) {
-        queue->tail = NULL;
-    }
-    queue->size--;
-    omp_unset_lock(&queue->lock);
-
-    *run = node->run;
-    *job = node->job;
-    free(node);
-    return true;
+    pthread_mutex_unlock(&queue->mutex);
+    return item;
 }
 
-void job_queue_close(job_queue_t *queue, size_t n_waiters)
+void job_queue_close(job_queue_t *queue)
 {
-    omp_set_lock(&queue->lock);
+    pthread_mutex_lock(&queue->mutex);
     queue->closed = true;
-    omp_unset_lock(&queue->lock);
-
-    for (size_t i = 0; i < n_waiters; i++) {
-        sem_post(&queue->items);
-    }
+    pthread_cond_broadcast(&queue->not_empty);
+    pthread_mutex_unlock(&queue->mutex);
 }
 
 size_t job_queue_size(job_queue_t *queue)
 {
-    omp_set_lock(&queue->lock);
-    size_t size = queue->size;
-    omp_unset_lock(&queue->lock);
-    return size;
+    pthread_mutex_lock(&queue->mutex);
+    size_t count = queue->count;
+    pthread_mutex_unlock(&queue->mutex);
+    return count;
 }

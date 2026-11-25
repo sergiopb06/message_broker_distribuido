@@ -8,6 +8,7 @@
 #include "protocol.h"
 #include "groups.h"
 #include "net_util.h"
+#include "job_queue.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -20,9 +21,18 @@
 #include <time.h>
 
 #define HEARTBEAT_INTERVAL_MS 500
-#define REPLICA_TIMEOUT_MS 3000.0
+// A replica with no fetch for this long leaves the ISR, and a peer with no
+// heartbeat for this long is considered down. MB_REPLICA_TIMEOUT_MS overrides it
+// (tests and demos); it must stay above FETCH_KEEPALIVE_MS and HEARTBEAT_INTERVAL_MS.
+#define DEFAULT_REPLICA_TIMEOUT_MS 3000.0
+static double g_replica_timeout_ms = DEFAULT_REPLICA_TIMEOUT_MS;
+#define REPLICA_TIMEOUT_MS g_replica_timeout_ms
 #define FETCH_CHUNK_BYTES (64 * 1024)
-#define FETCH_IDLE_MS 20
+// An idle replica still fetches this often: the fetch doubles as its keepalive,
+// so it must stay well below REPLICA_TIMEOUT_MS. New data does not wait for it:
+// the leader sends FETCH_WAKE as soon as it appends to a partition.
+#define FETCH_KEEPALIVE_MS 500
+#define FETCH_TIMEOUT_MS 1000
 #define STATE_TIMEOUT_MS 900
 #define READ_TIMEOUT_MS 1200
 #define PRODUCE_TIMEOUT_MS 7000
@@ -41,6 +51,7 @@ typedef struct {
     int64_t leo;
     double last_seen_ms;
     bool in_isr;
+    bool idle; // its last fetch found nothing new: wake it on the next append
 } replica_state_t;
 
 typedef struct part_state {
@@ -65,6 +76,11 @@ typedef struct {
 typedef struct {
     admin_cmd_t cmd;
 } admin_msg_t;
+
+typedef struct {
+    char topic[META_NAME_MAX];
+    int partition;
+} fetch_wake_msg_t;
 
 typedef struct {
     char topic[META_NAME_MAX];
@@ -112,7 +128,6 @@ typedef struct forward_job {
     int tag;
     int source;
     size_t len;
-    struct forward_job *next;
     char data[];
 } forward_job_t;
 
@@ -140,6 +155,7 @@ static pthread_t g_heartbeat_thread;
 
 static pthread_mutex_t g_fetch_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_fetch_cond = PTHREAD_COND_INITIALIZER;
+static bool g_fetch_pending = false; // protected by g_fetch_mutex
 
 // Wakes threads that wait for data hosted on another broker. Every heartbeat
 // and every completed fetch advances the tick, so no thread polls in a loop.
@@ -147,12 +163,10 @@ static pthread_mutex_t g_tick_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_tick_cond = PTHREAD_COND_INITIALIZER;
 static uint64_t g_tick = 0;
 
-static pthread_mutex_t g_fwd_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_fwd_cond = PTHREAD_COND_INITIALIZER;
-static forward_job_t *g_fwd_head = NULL;
-static forward_job_t *g_fwd_tail = NULL;
-static size_t g_fwd_count = 0;
-static bool g_fwd_closed = false;
+// Requests from other brokers that may block (acks=all, groups) wait here for a
+// forward worker, so the MPI receiver never blocks.
+static job_queue_t g_fwd_queue;
+static bool g_fwd_queue_ready = false;
 static pthread_t g_fwd_threads[FORWARD_WORKERS];
 static bool g_fwd_started = false;
 
@@ -186,6 +200,16 @@ static void tick_advance(void)
     g_tick++;
     pthread_cond_broadcast(&g_tick_cond);
     pthread_mutex_unlock(&g_tick_mutex);
+}
+
+// Makes the fetch loop run a pass now instead of at its next keepalive: the
+// leader has new data, the metadata changed, the broker resumed or stops.
+static void fetch_wake(void)
+{
+    pthread_mutex_lock(&g_fetch_mutex);
+    g_fetch_pending = true;
+    pthread_cond_broadcast(&g_fetch_cond);
+    pthread_mutex_unlock(&g_fetch_mutex);
 }
 
 static uint64_t tick_value(void)
@@ -229,11 +253,21 @@ bool repl_is_paused(void)
 void repl_set_paused(bool paused)
 {
     pthread_mutex_lock(&g_pause_mutex);
+    bool was_paused = g_paused;
     g_paused = paused;
-    if (!g_paused) {
+    if (was_paused && !paused) {
+        pthread_mutex_lock(&g_peer_mutex);
+        double now = now_ms();
+        for (int i = 0; i < 128; i++) {
+            g_peer_last_seen_ms[i] = now;
+        }
+        pthread_mutex_unlock(&g_peer_mutex);
         pthread_cond_broadcast(&g_pause_cond);
     }
     pthread_mutex_unlock(&g_pause_mutex);
+    if (was_paused && !paused) {
+        fetch_wake();
+    }
 }
 
 void repl_wait_if_paused(void)
@@ -292,6 +326,7 @@ static part_state_t *get_or_create_part_state(const char *topic, int partition)
         ps->replica_states[k].leo = 0;
         ps->replica_states[k].last_seen_ms = now;
         ps->replica_states[k].in_isr = true;
+        ps->replica_states[k].idle = false;
     }
 
     ps->next = g_part_states;
@@ -313,10 +348,8 @@ static void update_hwm_locked(part_state_t *ps, partition_log_t *log)
             }
         }
     }
-    // A replica that hasn't sent a fetch request for a long time should be removed from the ISR
-    // *before* calculating the minimum LEO, not just when heartbeats expire.
-    // However, for now, this logic seems okay, assuming heartbeat_loop handles ISR removal.
-    // The issue might be that HWM only moves up.
+    // Replicas that stopped fetching leave the ISR in heartbeat_loop, which then
+    // calls this again so the HWM can advance without them. The HWM never moves back.
     if (min_leo > plog_hwm(log)) {
         plog_set_hwm(log, min_leo);
         pthread_cond_broadcast(&ps->hwm_cond);
@@ -423,8 +456,7 @@ static int remote_partition_state(const char *topic, int partition, int leader,
 }
 
 // The leader is the only broker that knows the real ISR and HWM, so ask it
-// whenever the partition is not led here. If it is paused, fall back to the
-// local copy so `topic describe` still answers.
+// whenever the partition is not led here.
 int repl_partition_state(const char *topic, int partition, int *isr, int *n_isr,
                          int64_t *hwm, int64_t *leo)
 {
@@ -437,12 +469,9 @@ int repl_partition_state(const char *topic, int partition, int *isr, int *n_isr,
         return local_partition_state(topic, partition, NULL, hwm, leo, isr, n_isr);
     }
 
-    int rc = remote_partition_state(topic, partition, info.leader, NULL, hwm, leo, isr, n_isr);
-    if (rc == MB_OK) {
-        return MB_OK;
-    }
-
-    return local_partition_state(topic, partition, NULL, hwm, leo, isr, n_isr);
+    // Only the leader knows the ISR. If it does not answer, fail: meta_describe
+    // then prints this broker's own HWM and LEO without an ISR.
+    return remote_partition_state(topic, partition, info.leader, NULL, hwm, leo, isr, n_isr);
 }
 
 int repl_get_isr(const char *topic, int partition, int *isr, int *n_isr)
@@ -550,7 +579,6 @@ static void handle_fetch_req(int source, const void *buf, size_t len, void *arg)
         mpil_reply(source, req_id, &err_hwm, sizeof(err_hwm));
         return;
     }
-
     pthread_mutex_lock(&ps->mutex);
     double now = now_ms();
     for (int k = 0; k < ps->n_replicas; k++) {
@@ -560,18 +588,22 @@ static void handle_fetch_req(int source, const void *buf, size_t len, void *arg)
             if (!ps->replica_states[k].in_isr && req->from_offset >= plog_hwm(log)) {
                 ps->replica_states[k].in_isr = true;
             }
+            // Read under ps->mutex, like repl_notify_append: an append either is
+            // already visible here or finds the replica idle and wakes it.
+            ps->replica_states[k].idle = (req->from_offset >= plog_end_offset(log));
             break;
         }
     }
     update_hwm_locked(ps, log);
     int64_t current_hwm = plog_hwm(log);
+    int64_t current_start = plog_start_offset(log);
     pthread_mutex_unlock(&ps->mutex);
 
     message_t *msgs = NULL;
     size_t count = 0;
     (void)plog_read(log, req->from_offset, FETCH_CHUNK_BYTES, false, &msgs, &count);
 
-    size_t resp_len = sizeof(int64_t) + sizeof(uint32_t);
+    size_t resp_len = sizeof(int64_t) * 2 + sizeof(uint32_t);
     for (size_t i = 0; i < count; i++) {
         resp_len += sizeof(int64_t) + sizeof(int64_t) + sizeof(uint32_t) + sizeof(uint32_t)
                     + msgs[i].key_len + msgs[i].value_len;
@@ -581,6 +613,8 @@ static void handle_fetch_req(int source, const void *buf, size_t len, void *arg)
     if (resp != NULL) {
         char *p = resp;
         memcpy(p, &current_hwm, sizeof(int64_t));
+        p += sizeof(int64_t);
+        memcpy(p, &current_start, sizeof(int64_t));
         p += sizeof(int64_t);
         uint32_t ucount = (uint32_t)count;
         memcpy(p, &ucount, sizeof(uint32_t));
@@ -609,6 +643,39 @@ static void handle_fetch_req(int source, const void *buf, size_t len, void *arg)
         plog_free_messages(msgs);
     }
     tick_advance();
+}
+
+void repl_notify_append(const char *topic, int partition)
+{
+    if (g_size <= 1) {
+        return;
+    }
+    part_state_t *ps = get_or_create_part_state(topic, partition);
+    if (ps == NULL || ps->leader != g_rank) {
+        return;
+    }
+    fetch_wake_msg_t msg;
+    memset(&msg, 0, sizeof msg);
+    snprintf(msg.topic, sizeof msg.topic, "%s", topic);
+    msg.partition = partition;
+
+    pthread_mutex_lock(&ps->mutex);
+    for (int k = 0; k < ps->n_replicas; k++) {
+        if (ps->replicas[k] != g_rank && ps->replica_states[k].idle) {
+            ps->replica_states[k].idle = false;
+            (void)mpil_send(ps->replicas[k], MPIL_TAG_FETCH_WAKE, &msg, sizeof msg);
+        }
+    }
+    pthread_mutex_unlock(&ps->mutex);
+}
+
+static void handle_fetch_wake(int source, const void *buf, size_t len, void *arg)
+{
+    (void)source;
+    (void)buf;
+    (void)len;
+    (void)arg;
+    fetch_wake();
 }
 
 static void handle_heartbeat(int source, const void *buf, size_t len, void *arg)
@@ -665,6 +732,7 @@ static void handle_meta_diffuse(int source, const void *buf, size_t len, void *a
         free(text);
     }
     tick_advance();
+    fetch_wake(); // a new topic may make this broker a replica
 }
 
 static void handle_meta_req(int source, const void *buf, size_t len, void *arg)
@@ -952,45 +1020,14 @@ static int forward_queue_push(int tag, int source, const void *buf, size_t len)
     job->tag = tag;
     job->source = source;
     job->len = len;
-    job->next = NULL;
     if (len > 0) {
         memcpy(job->data, buf, len);
     }
-
-    pthread_mutex_lock(&g_fwd_mutex);
-    if (g_fwd_closed || g_fwd_count >= FORWARD_QUEUE_MAX) {
-        pthread_mutex_unlock(&g_fwd_mutex);
+    if (!g_fwd_queue_ready || job_queue_push(&g_fwd_queue, job) != 0) {
         free(job);
         return -1;
     }
-    if (g_fwd_tail == NULL) {
-        g_fwd_head = job;
-    } else {
-        g_fwd_tail->next = job;
-    }
-    g_fwd_tail = job;
-    g_fwd_count++;
-    pthread_cond_signal(&g_fwd_cond);
-    pthread_mutex_unlock(&g_fwd_mutex);
     return 0;
-}
-
-static forward_job_t *forward_queue_pop(void)
-{
-    pthread_mutex_lock(&g_fwd_mutex);
-    while (g_fwd_head == NULL && !g_fwd_closed) {
-        pthread_cond_wait(&g_fwd_cond, &g_fwd_mutex);
-    }
-    forward_job_t *job = g_fwd_head;
-    if (job != NULL) {
-        g_fwd_head = job->next;
-        if (g_fwd_head == NULL) {
-            g_fwd_tail = NULL;
-        }
-        g_fwd_count--;
-    }
-    pthread_mutex_unlock(&g_fwd_mutex);
-    return job;
 }
 
 static void reply_queue_full(int tag, int source, const void *buf, size_t len)
@@ -1085,6 +1122,7 @@ static void process_produce_req(int source, const void *buf, size_t len)
         if (status != MB_OK) {
             resp.status = status;
         } else {
+            repl_notify_append(req.topic, req.partition);
             topic_info_t tinfo;
             if (meta_topic_info(req.topic, &tinfo) == MB_OK && tinfo.replication <= 1) {
                 plog_set_hwm(log, offset + 1);
@@ -1107,7 +1145,7 @@ static void *forward_worker(void *arg)
 {
     (void)arg;
     for (;;) {
-        forward_job_t *job = forward_queue_pop();
+        forward_job_t *job = job_queue_pop(&g_fwd_queue);
         if (job == NULL) {
             break;
         }
@@ -1273,170 +1311,228 @@ int repl_forward_topic_create(const char *name, int partitions, int replication,
 // Background threads
 //----------------------------------------------------------------------------
 
+// Parses the messages of a fetch reply. Returns the array (free with
+// free_fetched) or NULL when the reply is malformed.
+static message_t *parse_fetched(const char *ptr, size_t avail, uint32_t count)
+{
+    message_t *msgs = calloc(count, sizeof(message_t));
+    if (msgs == NULL) {
+        return NULL;
+    }
+    size_t consumed = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t header = sizeof(int64_t) * 2 + sizeof(uint32_t) * 2;
+        if (consumed + header > avail) {
+            goto bad;
+        }
+        memcpy(&msgs[i].offset, ptr, sizeof(int64_t));
+        ptr += sizeof(int64_t);
+        memcpy(&msgs[i].timestamp_ms, ptr, sizeof(int64_t));
+        ptr += sizeof(int64_t);
+        memcpy(&msgs[i].key_len, ptr, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
+        memcpy(&msgs[i].value_len, ptr, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
+        consumed += header;
+        if (consumed + msgs[i].key_len + msgs[i].value_len > avail) {
+            goto bad;
+        }
+        if (msgs[i].key_len > 0) {
+            msgs[i].key = malloc(msgs[i].key_len);
+            if (msgs[i].key == NULL) {
+                goto bad;
+            }
+            memcpy(msgs[i].key, ptr, msgs[i].key_len);
+            ptr += msgs[i].key_len;
+        }
+        if (msgs[i].value_len > 0) {
+            msgs[i].value = malloc(msgs[i].value_len);
+            if (msgs[i].value == NULL) {
+                goto bad;
+            }
+            memcpy(msgs[i].value, ptr, msgs[i].value_len);
+            ptr += msgs[i].value_len;
+        }
+        consumed += msgs[i].key_len + msgs[i].value_len;
+    }
+    return msgs;
+bad:
+    for (uint32_t i = 0; i < count; i++) {
+        free(msgs[i].key);
+        free(msgs[i].value);
+    }
+    free(msgs);
+    return NULL;
+}
+
+static void free_fetched(message_t *msgs, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        free(msgs[i].key);
+        free(msgs[i].value);
+    }
+    free(msgs);
+}
+
+// One FETCH(from = local LEO) to the leader of a partition this broker
+// replicates. Returns how many messages were appended (0 when it is up to date
+// or the leader did not answer). The request itself tells the leader how far
+// this replica got, which is what lets the leader advance the HWM.
+static uint32_t fetch_partition(const char *topic, int partition, int leader)
+{
+    partition_log_t *log = meta_get_log(topic, partition);
+    if (log == NULL) {
+        return 0;
+    }
+
+    int64_t from_offset = plog_end_offset(log);
+    fetch_req_t req;
+    memset(&req, 0, sizeof req);
+    snprintf(req.topic, sizeof req.topic, "%s", topic);
+    req.partition = partition;
+    req.from_offset = from_offset;
+    req.replica_rank = g_rank;
+
+    void *reply = NULL;
+    size_t reply_len = 0;
+    int rc = mpil_request(leader, MPIL_TAG_FETCH_REQ, &req, sizeof(req), &reply, &reply_len,
+                          FETCH_TIMEOUT_MS);
+    const size_t header = sizeof(int64_t) * 2 + sizeof(uint32_t);
+    if (rc != MB_OK || reply == NULL || reply_len < header) {
+        free(reply);
+        return 0;
+    }
+
+    const char *ptr = (const char *)reply;
+    int64_t leader_hwm = 0;
+    int64_t leader_start = 0;
+    uint32_t count = 0;
+    memcpy(&leader_hwm, ptr, sizeof(int64_t));
+    memcpy(&leader_start, ptr + sizeof(int64_t), sizeof(int64_t));
+    memcpy(&count, ptr + sizeof(int64_t) * 2, sizeof(uint32_t));
+
+    uint32_t appended = 0;
+    if (leader_hwm >= 0 && count > 0) {
+        message_t *msgs = parse_fetched(ptr + header, reply_len - header, count);
+        if (msgs != NULL) {
+            int append_rc = plog_append_replica(log, msgs, count);
+            if (append_rc == MB_ERR_OFFSET_OUT_OF_RANGE && leader_start > from_offset
+                && msgs[0].offset == leader_start) {
+                // The leader's retention already dropped offsets this replica was
+                // missing (it was paused for a long time). Those messages are gone
+                // from the cluster, so restart the local log where the leader's
+                // starts. Offsets are never reused: leader_start > our LEO.
+                if (plog_reset_replica(log, leader_start) == MB_OK) {
+                    append_rc = plog_append_replica(log, msgs, count);
+                }
+            }
+            if (append_rc == MB_OK) {
+                appended = count;
+            }
+            free_fetched(msgs, count);
+        }
+    }
+    if (leader_hwm >= 0) {
+        // Clamped to the local LEO by the log: a replica never exposes more than it has.
+        plog_set_hwm(log, leader_hwm);
+    }
+    free(reply);
+    tick_advance();
+    return appended;
+}
+
+// One pass over every partition this broker replicates (and does not lead).
+// Returns true if any of them received data, so the caller fetches again at once.
+static bool fetch_pass(void)
+{
+    char *list = NULL;
+    size_t list_len = 0;
+    if (meta_list_alloc(&list, &list_len) != MB_OK || list == NULL) {
+        return false;
+    }
+
+    bool progress = false;
+    char *save = NULL;
+    for (char *line = strtok_r(list, "\n", &save); line != NULL && !atomic_load(&g_repl_stopping);
+         line = strtok_r(NULL, "\n", &save)) {
+        char topic[META_NAME_MAX];
+        int partitions = 0;
+        int replication = 0;
+        if (sscanf(line, "%63s partitions=%d replication=%d", topic, &partitions, &replication) != 3
+            || replication <= 1) {
+            continue;
+        }
+        for (int p = 0; p < partitions && !atomic_load(&g_repl_stopping); p++) {
+            partition_info_t pinfo;
+            if (meta_get_partition(topic, p, &pinfo) != MB_OK || pinfo.leader == g_rank) {
+                continue;
+            }
+            bool am_replica = false;
+            for (int k = 0; k < pinfo.n_replicas; k++) {
+                if (pinfo.replicas[k] == g_rank) {
+                    am_replica = true;
+                    break;
+                }
+            }
+            // A paused or crashed leader would make this pass wait FETCH_TIMEOUT_MS
+            // for nothing and delay every other partition: skip it until its
+            // heartbeats come back.
+            if (!am_replica || !peer_alive(pinfo.leader)) {
+                continue;
+            }
+            if (fetch_partition(topic, p, pinfo.leader) > 0) {
+                progress = true;
+            }
+        }
+    }
+    free(list);
+    return progress;
+}
+
+// Pull replication: asks each leader for what this broker is missing. With
+// nothing new it sleeps on g_fetch_cond until a FETCH_WAKE (the leader appended),
+// a metadata change, a resume or the shutdown, at most FETCH_KEEPALIVE_MS so the
+// leaders keep it in the ISR.
 static void *fetch_loop(void *arg)
 {
     (void)arg;
     while (!atomic_load(&g_repl_stopping)) {
-        if (repl_is_paused()) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 100000000L;
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1000000000L;
-            }
-            pthread_mutex_lock(&g_fetch_mutex);
-            pthread_cond_timedwait(&g_fetch_cond, &g_fetch_mutex, &ts);
-            pthread_mutex_unlock(&g_fetch_mutex);
-            continue;
+        pthread_mutex_lock(&g_pause_mutex);
+        while (g_paused && !atomic_load(&g_repl_stopping)) {
+            pthread_cond_wait(&g_pause_cond, &g_pause_mutex);
         }
+        pthread_mutex_unlock(&g_pause_mutex);
+        if (atomic_load(&g_repl_stopping)) {
+            break;
+        }
+
+        pthread_mutex_lock(&g_fetch_mutex);
+        g_fetch_pending = false;
+        pthread_mutex_unlock(&g_fetch_mutex);
 
         // A resumed broker may have missed topic creations while paused.
         if (atomic_exchange(&g_need_metadata, false) && g_rank != 0 && peer_alive(0)) {
             (void)repl_request_metadata();
         }
 
-        char list_buf[4096];
-        if (meta_list(list_buf, sizeof(list_buf)) == MB_OK) {
-            char *line = list_buf;
-            while (*line != '\0' && !atomic_load(&g_repl_stopping)) {
-                char *next = strchr(line, '\n');
-                if (next != NULL) {
-                    *next = '\0';
-                }
-                char topic[META_NAME_MAX];
-                int partitions = 0;
-                int replication = 0;
-                unsigned long long retention = 0;
-                if (sscanf(line, "%63s partitions=%d replication=%d retention.bytes=%llu",
-                           topic, &partitions, &replication, &retention) >= 3) {
-                    for (int p = 0; p < partitions && !atomic_load(&g_repl_stopping); p++) {
-                        partition_info_t pinfo;
-                        if (meta_get_partition(topic, p, &pinfo) != MB_OK) {
-                            continue;
-                        }
-                        if (pinfo.leader == g_rank) {
-                            continue;
-                        }
-
-                        bool am_replica = false;
-                        for (int k = 0; k < pinfo.n_replicas; k++) {
-                            if (pinfo.replicas[k] == g_rank) {
-                                am_replica = true;
-                                break;
-                            }
-                        }
-                        if (!am_replica) {
-                            continue;
-                        }
-
-                        partition_log_t *log = meta_get_log(topic, p);
-                        if (log == NULL) {
-                            continue;
-                        }
-
-                        int64_t from_offset = plog_end_offset(log);
-                        fetch_req_t req;
-                        memset(&req, 0, sizeof req);
-                        snprintf(req.topic, sizeof req.topic, "%s", topic);
-                        req.partition = p;
-                        req.from_offset = from_offset;
-                        req.replica_rank = g_rank;
-
-                        void *reply = NULL;
-                        size_t reply_len = 0;
-                        int rc = mpil_request(pinfo.leader, MPIL_TAG_FETCH_REQ, &req, sizeof(req),
-                                             &reply, &reply_len, 1000);
-                        if (rc == MB_OK && reply != NULL
-                            && reply_len >= sizeof(int64_t) + sizeof(uint32_t)) {
-                            const char *ptr = (const char *)reply;
-                            int64_t leader_hwm = 0;
-                            memcpy(&leader_hwm, ptr, sizeof(int64_t));
-                            ptr += sizeof(int64_t);
-                            uint32_t count = 0;
-                            memcpy(&count, ptr, sizeof(uint32_t));
-                            ptr += sizeof(uint32_t);
-
-                            if (leader_hwm >= 0 && count > 0) {
-                                message_t *msgs = calloc(count, sizeof(message_t));
-                                bool parse_ok = (msgs != NULL);
-                                size_t consumed = sizeof(int64_t) + sizeof(uint32_t);
-
-                                for (uint32_t i = 0; parse_ok && i < count; i++) {
-                                    if (consumed + sizeof(int64_t) * 2 + sizeof(uint32_t) * 2 > reply_len) {
-                                        parse_ok = false;
-                                        break;
-                                    }
-                                    memcpy(&msgs[i].offset, ptr, sizeof(int64_t));
-                                    ptr += sizeof(int64_t);
-                                    memcpy(&msgs[i].timestamp_ms, ptr, sizeof(int64_t));
-                                    ptr += sizeof(int64_t);
-                                    memcpy(&msgs[i].key_len, ptr, sizeof(uint32_t));
-                                    ptr += sizeof(uint32_t);
-                                    memcpy(&msgs[i].value_len, ptr, sizeof(uint32_t));
-                                    ptr += sizeof(uint32_t);
-                                    consumed += sizeof(int64_t) * 2 + sizeof(uint32_t) * 2;
-
-                                    if (consumed + msgs[i].key_len + msgs[i].value_len > reply_len) {
-                                        parse_ok = false;
-                                        break;
-                                    }
-                                    if (msgs[i].key_len > 0) {
-                                        msgs[i].key = malloc(msgs[i].key_len);
-                                        if (msgs[i].key == NULL) {
-                                            parse_ok = false;
-                                            break;
-                                        }
-                                        memcpy(msgs[i].key, ptr, msgs[i].key_len);
-                                        ptr += msgs[i].key_len;
-                                    }
-                                    if (msgs[i].value_len > 0) {
-                                        msgs[i].value = malloc(msgs[i].value_len);
-                                        if (msgs[i].value == NULL) {
-                                            parse_ok = false;
-                                            break;
-                                        }
-                                        memcpy(msgs[i].value, ptr, msgs[i].value_len);
-                                        ptr += msgs[i].value_len;
-                                    }
-                                    consumed += msgs[i].key_len + msgs[i].value_len;
-                                }
-
-                                if (parse_ok) {
-                                    plog_append_replica(log, msgs, count);
-                                }
-
-                                for (uint32_t i = 0; i < count; i++) {
-                                    free(msgs[i].key);
-                                    free(msgs[i].value);
-                                }
-                                free(msgs);
-                            }
-
-                            if (leader_hwm >= 0) {
-                                plog_set_hwm(log, leader_hwm);
-                            }
-                            tick_advance();
-                        }
-                        free(reply);
-                    }
-                }
-                if (next == NULL) {
-                    break;
-                }
-                line = next + 1;
-            }
+        if (fetch_pass()) {
+            continue; // got data: report the new LEO right away so the HWM advances
         }
 
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += (long)FETCH_IDLE_MS * 1000000L;
+        ts.tv_sec += FETCH_KEEPALIVE_MS / 1000;
+        ts.tv_nsec += (long)(FETCH_KEEPALIVE_MS % 1000) * 1000000L;
         if (ts.tv_nsec >= 1000000000L) {
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
         pthread_mutex_lock(&g_fetch_mutex);
-        pthread_cond_timedwait(&g_fetch_cond, &g_fetch_mutex, &ts);
+        while (!g_fetch_pending && !atomic_load(&g_repl_stopping)) {
+            if (pthread_cond_timedwait(&g_fetch_cond, &g_fetch_mutex, &ts) == ETIMEDOUT) {
+                break;
+            }
+        }
         pthread_mutex_unlock(&g_fetch_mutex);
     }
     return NULL;
@@ -1505,11 +1601,25 @@ int repl_init(int rank, int size)
     g_size = size;
     g_repl_started = false;
     atomic_store(&g_repl_stopping, false);
-    g_fwd_closed = false;
-    g_fwd_head = NULL;
-    g_fwd_tail = NULL;
-    g_fwd_count = 0;
     g_fwd_started = false;
+    if (!g_fwd_queue_ready) {
+        if (job_queue_init(&g_fwd_queue, FORWARD_QUEUE_MAX) != 0) {
+            return -1;
+        }
+        g_fwd_queue_ready = true;
+    }
+
+    const char *timeout_env = getenv("MB_REPLICA_TIMEOUT_MS");
+    if (timeout_env != NULL) {
+        char *end = NULL;
+        double value = strtod(timeout_env, &end);
+        if (end != timeout_env && *end == '\0' && value >= 2.0 * FETCH_KEEPALIVE_MS) {
+            g_replica_timeout_ms = value;
+        } else {
+            fprintf(stderr, "broker %d: ignoring MB_REPLICA_TIMEOUT_MS=%s (minimum %d)\n",
+                    rank, timeout_env, 2 * FETCH_KEEPALIVE_MS);
+        }
+    }
 
     double now = now_ms();
     for (int i = 0; i < 128; i++) {
@@ -1525,6 +1635,7 @@ int repl_init(int rank, int size)
     mpil_register(MPIL_TAG_READ_REQ, handle_read_req, NULL);
     mpil_register(MPIL_TAG_FORWARD_REQ, handle_forward_req, NULL);
     mpil_register(MPIL_TAG_PRODUCE_REQ, handle_produce_req, NULL);
+    mpil_register(MPIL_TAG_FETCH_WAKE, handle_fetch_wake, NULL);
 
     return 0;
 }
@@ -1569,6 +1680,33 @@ int repl_start(void)
     return 0;
 }
 
+// Writes every local partition and its HWM checkpoint to disk.
+static void flush_local_logs(void)
+{
+    char *list = NULL;
+    size_t list_len = 0;
+    if (meta_list_alloc(&list, &list_len) != MB_OK || list == NULL) {
+        return;
+    }
+    char *save = NULL;
+    for (char *line = strtok_r(list, "\n", &save); line != NULL; line = strtok_r(NULL, "\n", &save)) {
+        char topic[META_NAME_MAX];
+        int partitions = 0;
+        if (sscanf(line, "%63s partitions=%d", topic, &partitions) != 2) {
+            continue;
+        }
+        for (int p = 0; p < partitions; p++) {
+            partition_log_t *log = meta_get_log(topic, p);
+            if (log != NULL && plog_flush(log) != MB_OK) {
+                fprintf(stderr, "broker %d: flush of %s/%d failed\n", g_rank, topic, p);
+            }
+        }
+    }
+    free(list);
+}
+
+// Replication side of the ordered shutdown. The server has already closed the
+// accept socket and finished its client requests.
 void repl_shutdown(void)
 {
     if (!g_repl_started || atomic_load(&g_repl_stopping)) {
@@ -1576,37 +1714,34 @@ void repl_shutdown(void)
     }
     atomic_store(&g_repl_stopping, true);
 
-    // Wake anything waiting for a pause, for data or for a forwarded reply.
+    // Wake every thread that sleeps on a condition owned by this module: paused
+    // threads, the fetch loop, the heartbeat loop, remote readers, acks=all
+    // waiters and forwarded requests waiting for an MPI reply.
     repl_set_paused(false);
-
-    pthread_mutex_lock(&g_fetch_mutex);
-    pthread_cond_broadcast(&g_fetch_cond);
-    pthread_mutex_unlock(&g_fetch_mutex);
+    pthread_mutex_lock(&g_pause_mutex);
+    pthread_cond_broadcast(&g_pause_cond);
+    pthread_mutex_unlock(&g_pause_mutex);
+    fetch_wake();
 
     pthread_mutex_lock(&g_tick_mutex);
     pthread_cond_broadcast(&g_tick_cond);
     pthread_mutex_unlock(&g_tick_mutex);
 
     pthread_mutex_lock(&g_part_states_mutex);
-    part_state_t *ps = g_part_states;
-    while (ps != NULL) {
+    for (part_state_t *ps = g_part_states; ps != NULL; ps = ps->next) {
         pthread_mutex_lock(&ps->mutex);
         pthread_cond_broadcast(&ps->hwm_cond);
         pthread_mutex_unlock(&ps->mutex);
-        ps = ps->next;
     }
     pthread_mutex_unlock(&g_part_states_mutex);
 
     mpil_abort_requests();
 
+    // Stop the threads that write to the logs or talk to other brokers.
     pthread_join(g_fetch_thread, NULL);
     pthread_join(g_heartbeat_thread, NULL);
 
-    // Drain the forwarded requests before the collective barrier.
-    pthread_mutex_lock(&g_fwd_mutex);
-    g_fwd_closed = true;
-    pthread_cond_broadcast(&g_fwd_cond);
-    pthread_mutex_unlock(&g_fwd_mutex);
+    job_queue_close(&g_fwd_queue);
 
     if (g_fwd_started) {
         for (int i = 0; i < FORWARD_WORKERS; i++) {
@@ -1618,10 +1753,35 @@ void repl_shutdown(void)
         g_fwd_started = false;
     }
 
-    // Distributed barrier: nobody finalizes MPI while another broker still
-    // has something to send.
+    // Flush only now that nothing can append any more.
+    flush_local_logs();
+
+    // Let every queued message leave, then wait for all brokers, so no one
+    // finalizes while a peer still sends to it.
+    if (mpil_drain_sends(2000) != 0) {
+        fprintf(stderr, "broker %d: MPI sends still pending at shutdown\n", g_rank);
+    }
     mpil_barrier();
+
+    // STOP to our own receiver, join the MPI threads, MPI_Finalize.
     mpil_shutdown();
+
+    // The receiver is gone, so nothing can push any more. The workers drained
+    // the queue after it was closed.
+    job_queue_destroy(&g_fwd_queue);
+    g_fwd_queue_ready = false;
+
+    pthread_mutex_lock(&g_part_states_mutex);
+    part_state_t *ps = g_part_states;
+    while (ps != NULL) {
+        part_state_t *next = ps->next;
+        pthread_mutex_destroy(&ps->mutex);
+        pthread_cond_destroy(&ps->hwm_cond);
+        free(ps);
+        ps = next;
+    }
+    g_part_states = NULL;
+    pthread_mutex_unlock(&g_part_states_mutex);
 
     g_repl_started = false;
 }

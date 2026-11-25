@@ -57,11 +57,16 @@ typedef struct {
 static int g_connections[MAX_ACTIVE_THREADS];
 static pthread_mutex_t g_connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+int server_is_running(void);
+void server_request_shutdown(void);
+
+// Only async-signal-safe calls here; main does the rest after the accept loop.
 static void on_sigint(int signum)
 {
     (void)signum;
     g_running = 0;
-    shutdown(listen_file_descriptor, SHUT_RD);
+    if(listen_file_descriptor >= 0)
+        shutdown(listen_file_descriptor, SHUT_RD);
 }
 
 int server_is_running(void){
@@ -233,7 +238,6 @@ static void reply_text(int file_descriptor, const command_t *command){
 //---------------------------------------------------------------------------
 
 //FNV-1a hash: http://www.isthe.com/chongo/tech/comp/fnv/
-//Written with the help of Claude (Anthropic)
 
 static atomic_uint g_next_partition = 0; //for messages without a key
 
@@ -296,6 +300,9 @@ static void produce_message(int file_descriptor, const command_t *command, const
 
     if(status == MB_OK && replication == 1)
         plog_set_hwm(log, offset + 1);
+
+    if(status == MB_OK && replication > 1)
+        repl_notify_append(command->topic, partition);
 
     if(command->acks == ACKS_NONE)
         return;
@@ -796,10 +803,14 @@ int main(int argc, char **argv)
 
     }
 
+    // Also needed after SIGINT: wakes a paused broker.
+    server_request_shutdown();
+
     if (close(listen_file_descriptor))
     {
         perror("close(listen_file_descriptor)");
     }
+    listen_file_descriptor = -1;
 
 
     wake_connections();

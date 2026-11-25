@@ -23,6 +23,10 @@ int repl_wait_acks(const char *topic, int partition, int64_t offset, acks_t acks
 
 bool repl_is_leader(const char *topic, int partition);
 
+// Called by the leader right after appending to a partition: wakes the replicas
+// whose last fetch found nothing new so they fetch the new data.
+void repl_notify_append(const char *topic, int partition);
+
 // Leader view of a partition (ISR, HWM and LEO), asking the leader over MPI
 // when this broker is not the leader.
 int repl_partition_state(const char *topic, int partition, int *isr, int *n_isr, int64_t *hwm, int64_t *leo);
@@ -36,7 +40,7 @@ int repl_partition_offsets(const char *topic, int partition, int64_t *start, int
 int repl_read(const char *topic, int partition, int64_t from, size_t max_bytes,
               message_t **out, size_t *n);
 
-// Blocks (no busy wait) until the partition has data past `from`.
+// Blocks until the partition has data past `from` or the timeout expires.
 int repl_wait_data(const char *topic, int partition, int64_t from, int timeout_ms);
 
 // Sends a produce to the partition leader over MPI.
