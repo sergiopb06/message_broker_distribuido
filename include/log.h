@@ -9,6 +9,7 @@
 
 #define PLOG_MAX_MESSAGE_BYTES (1u << 20)
 #define PLOG_DEFAULT_SEGMENT_BYTES (1ull << 26)
+#define PLOG_MIN_SEGMENT_BYTES (1ull << 12)
 
 typedef struct partition_log partition_log_t;
 
@@ -17,6 +18,9 @@ typedef struct partition_log partition_log_t;
 // The high watermark is restored from a checkpoint written by plog_flush and plog_close.
 // retention_bytes = 0 means no limit. Above the limit, whole segments are dropped oldest first,
 // but never the active segment nor data at or above the high watermark. Offsets are never reused.
+// A reader asking for an offset that retention already dropped continues from the first one left.
+// plog_open sizes the segments from the limit (retention_bytes / 4, at least
+// PLOG_MIN_SEGMENT_BYTES, at most PLOG_DEFAULT_SEGMENT_BYTES); plog_open_ex takes the size.
 partition_log_t *plog_open(const char *dir, uint64_t retention_bytes);
 partition_log_t *plog_open_ex(const char *dir, uint64_t retention_bytes, uint64_t segment_bytes);
 

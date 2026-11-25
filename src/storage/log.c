@@ -587,7 +587,16 @@ static void apply_retention_locked(partition_log_t *log)
 
 partition_log_t *plog_open(const char *dir, uint64_t retention_bytes)
 {
-    return plog_open_ex(dir, retention_bytes, PLOG_DEFAULT_SEGMENT_BYTES);
+    // Retention drops whole segments, so they must be much smaller than the
+    // limit: a quarter of it, between PLOG_MIN_SEGMENT_BYTES and the default.
+    uint64_t segment_bytes = PLOG_DEFAULT_SEGMENT_BYTES;
+    if (retention_bytes > 0 && retention_bytes / 4 < segment_bytes) {
+        segment_bytes = retention_bytes / 4;
+        if (segment_bytes < PLOG_MIN_SEGMENT_BYTES) {
+            segment_bytes = PLOG_MIN_SEGMENT_BYTES;
+        }
+    }
+    return plog_open_ex(dir, retention_bytes, segment_bytes);
 }
 
 partition_log_t *plog_open_ex(const char *dir, uint64_t retention_bytes, uint64_t segment_bytes)
