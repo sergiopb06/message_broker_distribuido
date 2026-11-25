@@ -16,6 +16,7 @@
 #include "log.h"
 #include "mpi_layer.h"
 #include "replication.h"
+#include "job_queue.h"
 
 #define MAX_GROUPS 64
 #define MAX_MEMBERS 32
@@ -24,6 +25,7 @@
 #define NO_OFFSET (-1)
 #define REBALANCE_TIMEOUT_SECONDS 10
 #define MAX_POLL_WAIT_MS 5000 //below REBALANCE_TIMEOUT_SECONDS, so a POLL never makes its member late
+#define GONE_QUEUE_CAPACITY 1024
 
 
 typedef enum{
@@ -71,6 +73,13 @@ static int g_size;
 static atomic_int g_stopping;
 static FILE *g_commit_file;
 static pthread_mutex_t g_commit_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+//GROUP_GONE arrives on the MPI receiver thread, but removing a member needs the
+//group mutexes, which other threads may hold across an MPI request. The receiver
+//only queues the id and this worker does the removal, so it never blocks.
+static job_queue_t g_gone_queue;
+static pthread_t g_gone_thread;
+static int g_gone_ready;
 
 static uint32_t group_fnv1a(const char *data, size_t len)
 {
@@ -255,6 +264,17 @@ static int save_commit(const group_t *group, int partition, long offset){
 
 
 
+//Groups reloaded from commits.log do not know their topic yet: ask the metadata
+static void ensure_partitions(group_t *group){
+    if(group->partitions > 0)
+        return;
+
+    topic_info_t info;
+    if(meta_topic_info(group->topic, &info) == MB_OK && info.partitions <= MAX_PARTITIONS)
+        group->partitions = info.partitions;
+}
+
+
 static void write_assignment(const group_t *group, unsigned long id, char *out, size_t size){
     size_t used = (size_t)snprintf(out, size, "%ld ", group->generation);
     int any = 0;
@@ -346,6 +366,7 @@ static const char *state_text(group_state_t state){
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static void handle_group_gone(int source, const void *buf, size_t len, void *arg);
+static void *gone_worker(void *arg);
 
 int groups_init(const char *data_dir, int rank, int size){
    snprintf(g_data_dir, sizeof g_data_dir, "%s", data_dir);
@@ -354,6 +375,13 @@ int groups_init(const char *data_dir, int rank, int size){
    atomic_store(&g_stopping, 0);
 
    // A client that disconnects without LEAVE is removed everywhere.
+   if(job_queue_init(&g_gone_queue, GONE_QUEUE_CAPACITY) != 0)
+       return -1;
+   if(pthread_create(&g_gone_thread, NULL, gone_worker, NULL) != 0){
+       job_queue_destroy(&g_gone_queue);
+       return -1;
+   }
+   g_gone_ready = 1;
    mpil_register(MPIL_TAG_GROUP_GONE, handle_group_gone, NULL);
 
    char path[512];
@@ -469,7 +497,13 @@ static int group_join_id(const char *topic, const char *name, unsigned long id, 
             break;
         }
 
+        //The member may have been removed while waiting (its client disconnected
+        //or it left): there is nothing left to assign
         index = find_member(group, id);
+        if(index < 0){
+            status = MB_ERR_REBALANCE;
+            break;
+        }
         group->members[index].generation = group->generation;
         try_finish_rebalance(group);
 
@@ -482,7 +516,8 @@ static int group_join_id(const char *topic, const char *name, unsigned long id, 
     }
 
     index = find_member(group, id);
-    group->members[index].joining = 0;
+    if(index >= 0)
+        group->members[index].joining = 0;
 
     if(status == MB_OK)
         write_assignment(group, id, out, size);
@@ -553,9 +588,30 @@ static void handle_group_gone(int source, const void *buf, size_t len, void *arg
     if(len < sizeof(unsigned long))
         return;
 
-    unsigned long id = 0;
-    memcpy(&id, buf, sizeof id);
-    remove_member_from_all_groups(id);
+    unsigned long *id = malloc(sizeof *id);
+    if(id == NULL)
+        return;
+
+    memcpy(id, buf, sizeof *id);
+    //Full or closed queue: the member is dropped anyway when the next
+    //rebalance times out without it
+    if(job_queue_push(&g_gone_queue, id) != 0)
+        free(id);
+}
+
+static void *gone_worker(void *arg){
+    (void)arg;
+
+    for(;;){
+        unsigned long *id = job_queue_pop(&g_gone_queue);
+        if(id == NULL)
+            break;
+
+        remove_member_from_all_groups(*id);
+        free(id);
+    }
+
+    return NULL;
 }
 
 void group_member_gone(unsigned long member){
@@ -574,10 +630,9 @@ void group_member_gone(unsigned long member){
 
 
 
+//Commits are still accepted while the broker drains its in-flight requests:
+//groups_close() makes them durable once every handler has finished
 static int group_commit_id(const char *topic, const char *name, unsigned long id, long generation, int partition, long offset){
-    if(atomic_load(&g_stopping))
-        return MB_ERR_SHUTTING_DOWN;
-
     if(offset < 0)
         return MB_ERR_OFFSET_OUT_OF_RANGE;
 
@@ -852,12 +907,18 @@ int group_describe(const char *name, char *out, size_t size){
         void *reply = NULL;
         size_t reply_len = 0;
         int rc = mpil_request(coord, MPIL_TAG_FORWARD_REQ, req, strlen(req) + 1, &reply, &reply_len, 5000);
-        if(rc != MB_OK)
+        if(rc != MB_OK){
+            free(reply);
             return rc;
-        int status = *(const int *)reply;
-        if(reply_len > sizeof(int)){
-            snprintf(out, size, "%s", (const char *)reply + sizeof(int));
         }
+        if(reply == NULL || reply_len < sizeof(int)){
+            free(reply);
+            return -1;
+        }
+        int status = -1;
+        memcpy(&status, reply, sizeof(int));
+        if(reply_len > sizeof(int))
+            snprintf(out, size, "%.*s", (int)(reply_len - sizeof(int)), (const char *)reply + sizeof(int));
         free(reply);
         return status;
     }
@@ -876,6 +937,7 @@ int group_describe(const char *name, char *out, size_t size){
 
         found = 1;
         pthread_mutex_lock(&group->mutex);
+        ensure_partitions(group);
 
         append_text(out, size, &used, "group %s topic %s state %s generation %ld\n", group->name, group->topic, state_text(group->state), group->generation);
 
@@ -998,7 +1060,8 @@ void groups_handle_forward(int source, uint64_t req_id, const char *line, size_t
 
 
 
-//wake every JOIN and POLL waiting on a group and make the committed offsets durable
+//Phase 2 of the shutdown: wake every JOIN and POLL waiting on a group, so the
+//connection handlers can finish
 
 void groups_shutdown(void){
     atomic_store(&g_stopping, 1);
@@ -1017,7 +1080,23 @@ void groups_shutdown(void){
     }
 
     pthread_mutex_unlock(&g_groups_mutex);
+}
 
+
+//Phase 3, once no handler is left: stop the GROUP_GONE worker and make the
+//committed offsets durable
+
+void groups_close(void){
+    atomic_store(&g_stopping, 1);
+
+    if(g_gone_ready){
+        job_queue_close(&g_gone_queue);
+        pthread_join(g_gone_thread, NULL);
+        for(unsigned long *id; (id = job_queue_pop(&g_gone_queue)) != NULL;)
+            free(id);
+        job_queue_destroy(&g_gone_queue);
+        g_gone_ready = 0;
+    }
 
     pthread_mutex_lock(&g_commit_mutex);
 

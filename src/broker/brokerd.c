@@ -694,6 +694,7 @@ int main(int argc, char **argv)
 
     if(repl_init(rank, size) != 0 || repl_start() != 0){
         groups_shutdown();
+        groups_close();
         meta_destroy();
         return EXIT_FAILURE;
     }
@@ -716,6 +717,7 @@ int main(int argc, char **argv)
     if (listen_file_descriptor < 0)
     {
         groups_shutdown();
+        groups_close();
         meta_destroy();
         sem_destroy(&g_counting_sem);
         return EXIT_FAILURE;
@@ -816,6 +818,10 @@ int main(int argc, char **argv)
     }
 
     repl_shutdown();
+
+    // No client handler, forward worker or MPI receiver is left: stop the
+    // GROUP_GONE worker and make the committed offsets durable.
+    groups_close();
 
     meta_destroy();
 

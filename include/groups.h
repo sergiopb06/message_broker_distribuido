@@ -8,7 +8,12 @@
 
 int groups_init(const char *data_dir, int rank, int size);
 
+//Wakes every JOIN and POLL waiting on a group (in-flight commits still succeed).
 void groups_shutdown(void);
+
+//Once no connection handler is left: stops the GROUP_GONE worker, then flushes,
+//fsyncs and closes commits.log.
+void groups_close(void);
 
 int group_join(const char *topic, const char *group, unsigned long member, int from_beginning, char *out, size_t size);
 
