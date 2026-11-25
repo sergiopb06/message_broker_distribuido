@@ -1,102 +1,89 @@
 #!/usr/bin/env bash
+# setup_env.sh: one-time check of the toolchain on Kabré (run it on the login node).
 #
-# setup_env.sh: Configura el entorno en Kabré (CeNAT)
-# Carga módulos necesarios e instala libyaml en $HOME/.local si no existe en el sistema.
+#   bash scripts/kabre/setup_env.sh
 #
-set -euo pipefail
+# Loads the modules with env.sh, shows what was picked, checks that the MPI gives
+# MPI_THREAD_MULTIPLE (the broker refuses to start otherwise) and that the project
+# compiles without warnings. Nothing is installed and ~/.bashrc is not touched.
+set -uo pipefail
 
-echo "=================================================="
-echo "  Configuración de entorno para Kabré (CeNAT)     "
-echo "=================================================="
+cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
+# shellcheck source=scripts/kabre/env.sh
+source scripts/kabre/env.sh
 
-# 1. Cargar módulos de entorno si 'module' está disponible
-if command -v module &>/dev/null || type module &>/dev/null; then
-    echo "[+] Cargando módulos de HPC..."
-    # Intentar cargar una versión moderna de GCC (11+)
-    if module avail gcc 2>&1 | grep -q "gcc/11"; then
-        module load gcc/11* 2>/dev/null || true
-    elif module avail gcc 2>&1 | grep -q "gcc/"; then
-        module load gcc 2>/dev/null || true
-    fi
+echo "=========================================================="
+echo " Kabré environment for the message broker"
+echo "=========================================================="
+mb_print_env
 
-    # Cargar Python 3 si está como módulo
-    if module avail python 2>&1 | grep -q "python/3"; then
-        module load python/3* 2>/dev/null || true
-    elif module avail python 2>&1 | grep -q "python"; then
-        module load python 2>/dev/null || true
-    fi
+ok=1
+if ! command -v mpicc >/dev/null 2>&1; then
+    echo "[✘] mpicc not found. Available MPI modules:"
+    module -t avail 2>&1 | grep -iE 'mpi' | sed 's/^/      /'
+    echo "    Pick one with: MB_MODULES=\"gcc/<v> openmpi/<v>\" bash scripts/kabre/setup_env.sh"
+    exit 1
 fi
 
-echo "[i] Compilador C detectado: $(gcc --version 2>/dev/null | head -n1 || echo 'No encontrado')"
-echo "[i] Python detectado: $(python3 --version 2>/dev/null || echo 'No encontrado')"
-
-# 2. Configurar rutas de $HOME/.local
-mkdir -p "$HOME/.local/include" "$HOME/.local/lib" "$HOME/.local/bin"
-
-export CPATH="$HOME/.local/include${CPATH:+:$CPATH}"
-export LIBRARY_PATH="$HOME/.local/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
-export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export PATH="$HOME/.local/bin:$PATH"
-
-# 3. Comprobar si libyaml está disponible
-echo "[+] Comprobando libyaml..."
-LIBYAML_OK=0
-if echo '#include <yaml.h>' | gcc -E - &>/dev/null; then
-    echo "[✓] libyaml ya está disponible en el sistema o en \$HOME/.local."
-    LIBYAML_OK=1
-fi
-
-# 4. Instalar libyaml si hace falta
-if [ "$LIBYAML_OK" -eq 0 ]; then
-    echo "[!] libyaml no encontrada en rutas estándar. Procediendo a compilarla en $HOME/.local..."
-    BUILD_DIR=$(mktemp -d /tmp/libyaml-build.XXXXXX)
-    cd "$BUILD_DIR"
-
-    YAML_VER="0.2.5"
-    TARBALL="yaml-${YAML_VER}.tar.gz"
-    URL="https://github.com/yaml/libyaml/releases/download/${YAML_VER}/${TARBALL}"
-
-    echo "[+] Descargando libyaml ${YAML_VER}..."
-    if command -v wget &>/dev/null; then
-        wget -q "$URL" -O "$TARBALL"
-    elif command -v curl &>/dev/null; then
-        curl -fsSL "$URL" -o "$TARBALL"
-    else
-        echo "[-] Error: no se encontró wget ni curl. Descarga libyaml manualmente."
-        exit 1
-    fi
-
-    tar -xzf "$TARBALL"
-    cd "yaml-${YAML_VER}"
-
-    echo "[+] Configurando e instalando en $HOME/.local..."
-    ./configure --prefix="$HOME/.local" --disable-static >/dev/null
-    make -j"$(nproc 2>/dev/null || echo 2)" >/dev/null
-    make install >/dev/null
-
-    cd "$HOME"
-    rm -rf "$BUILD_DIR"
-    echo "[✓] libyaml instalada exitosamente en $HOME/.local."
-fi
-
-# 5. Agregar exportaciones al .bashrc si no están presentes
-BASHRC="$HOME/.bashrc"
-if [ -f "$BASHRC" ]; then
-    if ! grep -q "KABRE_PIPELINE_ENV" "$BASHRC"; then
-        echo "[+] Añadiendo variables de entorno a $BASHRC..."
-        cat << 'EOF' >> "$BASHRC"
-
-# >>> KABRE_PIPELINE_ENV >>>
-export CPATH="$HOME/.local/include${CPATH:+:$CPATH}"
-export LIBRARY_PATH="$HOME/.local/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
-export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export PATH="$HOME/.local/bin:$PATH"
-# <<< KABRE_PIPELINE_ENV <<<
+std=$(make -s -f - <<'EOF' 2>/dev/null
+include Makefile
+print-std: ; @echo $(STD)
 EOF
-        echo "[✓] .bashrc actualizado."
-    fi
+)
+echo "[i] C standard the Makefile will use: -std=${std:-?}"
+if [ "$std" = c11 ]; then
+    echo "[!] This gcc knows neither c23 nor c2x; load a newer gcc module (MB_MODULES) for the official flags."
 fi
 
-echo "=================================================="
-echo "[✓] Entorno listo. Ahora puedes ejecutar tus pruebas."
-echo "=================================================="
+# MPI_THREAD_MULTIPLE probe: one process, a few milliseconds.
+probe_dir=$(mktemp -d)
+cat > "$probe_dir/probe.c" <<'EOF'
+#include <mpi.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+    int provided = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    printf("%s\n", provided >= MPI_THREAD_MULTIPLE ? "MULTIPLE" : "LOWER");
+    MPI_Finalize();
+    return 0;
+}
+EOF
+if mpicc -o "$probe_dir/probe" "$probe_dir/probe.c" 2>/dev/null; then
+    level=$(timeout 60 "$MPIRUN" -np 1 "$probe_dir/probe" 2>/dev/null | tail -n 1)
+    if [ "$level" = MULTIPLE ]; then
+        echo "[✔] MPI_THREAD_MULTIPLE available"
+    elif [ -z "$level" ]; then
+        echo "[!] could not run the probe here (login node?); run_tests.slurm checks it again"
+    else
+        echo "[✘] this MPI does not give MPI_THREAD_MULTIPLE: try another MPI module"
+        ok=0
+    fi
+else
+    echo "[✘] mpicc could not compile a trivial program"
+    ok=0
+fi
+rm -rf "$probe_dir"
+
+echo "[+] Building (make clean all)..."
+if make clean >/dev/null && make -j"$(nproc 2>/dev/null || echo 4)" all > /tmp/mb_build_$$.log 2>&1; then
+    if grep -q 'warning' /tmp/mb_build_$$.log; then
+        echo "[✘] the build has warnings:"
+        grep 'warning' /tmp/mb_build_$$.log | head
+        ok=0
+    else
+        echo "[✔] build without warnings"
+    fi
+else
+    echo "[✘] build failed:"
+    tail -n 20 /tmp/mb_build_$$.log
+    ok=0
+fi
+rm -f /tmp/mb_build_$$.log
+
+echo "=========================================================="
+if [ "$ok" = 1 ]; then
+    echo "[✔] Ready. Next: sbatch scripts/kabre/run_tests.slurm"
+    exit 0
+fi
+echo "[✘] Fix the items above before submitting jobs."
+exit 1

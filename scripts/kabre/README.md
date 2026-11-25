@@ -1,49 +1,26 @@
-# Ejecución y Pruebas en el Cluster Kabré (CeNAT)
+# Ejecución en el clúster Kabré (CeNAT)
 
-Esta carpeta contiene utilidades automatizadas para sincronizar, compilar, configurar y ejecutar la suite de pruebas y métricas del servidor de pipelines concurrente en el supercomputador **Kabré** mediante **SLURM**.
+Scripts para compilar, probar y medir el message broker en Kabré con Slurm, en
+uno o en varios nodos. Todo se maneja desde tu máquina con `kabre.sh`: sincroniza
+el repositorio, envía el trabajo, espera a que termine, descarga el log y los
+resultados.
 
----
+## Archivos
 
-## Archivos incluidos
-
-| Archivo | Dónde se ejecuta | Descripción |
+| Archivo | Dónde corre | Qué hace |
 | :--- | :--- | :--- |
-| [`sync_to_kabre.sh`](file:///home/deck/pipelines/Servidor-de-pipelines-concurrente/scripts/kabre/sync_to_kabre.sh) | **Máquina local** | Sincroniza el código hacia Kabré vía `rsync` usando el puerto `22022`. |
-| [`pull_results.sh`](file:///home/deck/pipelines/Servidor-de-pipelines-concurrente/scripts/kabre/pull_results.sh) | **Máquina local** | Descarga los archivos CSV de resultados desde Kabré hacia `bench/results/`. |
-| [`setup_env.sh`](file:///home/deck/pipelines/Servidor-de-pipelines-concurrente/scripts/kabre/setup_env.sh) | **En Kabré** | Carga módulos requeridos (GCC, Python) e instala `libyaml` en `$HOME/.local` si no existe a nivel de sistema. |
-| [`run_tests.slurm`](file:///home/deck/pipelines/Servidor-de-pipelines-concurrente/scripts/kabre/run_tests.slurm) | **En Kabré** | Job de SLURM (`sbatch`) para compilar y correr la suite completa de pruebas (`make test`). |
-| [`run_bench.slurm`](file:///home/deck/pipelines/Servidor-de-pipelines-concurrente/scripts/kabre/run_bench.slurm) | **En Kabré** | Job de SLURM (`sbatch`) para ejecutar la batería de benchmarks (`bench/run.sh`) y Amdahl. |
+| `kabre.sh` | tu máquina | Punto de entrada: `sync`, `setup`, `tests`, `multinode`, `bench`, `all`, `pull`, `status`. Abre una sola conexión SSH (ControlMaster) y la reutiliza: la contraseña se pide una vez. |
+| `sync_to_kabre.sh` / `pull_results.sh` | tu máquina | Atajos de `kabre.sh sync` y `kabre.sh pull`. |
+| `env.sh` | Kabré | Carga el gcc más nuevo y un MPI (Open MPI primero, luego MPICH). Lo usan todos los trabajos. `MB_MODULES` fija módulos exactos. |
+| `common.sh` | Kabré | Prólogo de los trabajos: ubica la raíz del repo, carga `env.sh`, imprime el entorno y compila. |
+| `setup_env.sh` | Kabré (login) | Revisión única: módulos, `MPI_THREAD_MULTIPLE` y compilación sin advertencias. No instala nada ni toca `~/.bashrc`. |
+| `run_tests.slurm` | Kabré | `make test` en un nodo: pruebas unitarias, capa MPI (3 procesos) y clúster de 3 brokers. |
+| `run_tests_multinode.slurm` | Kabré | Capa MPI y prueba del clúster con **un broker por nodo** (3 nodos por omisión). Los clientes corren en el nodo del lote y llegan a cada broker por su IP. |
+| `run_bench.slurm` | Kabré | Batería de métricas (`bench/run.sh`): brokers, particiones, clave caliente, grupo de consumidores y costo de la replicación, 5 repeticiones. Un broker por nodo (hasta 4) o todos en un nodo. Datos en el disco local de cada nodo. |
 
----
+## Configuración de SSH (una vez)
 
-## Consideraciones y Soluciones a Fallos Comunes
-
-1. **Puerto SSH 22022**:
-   - Kabré **no** atiende en el puerto estándar 22; utiliza el puerto **`22022`**.
-   - Los scripts `sync_to_kabre.sh` y `pull_results.sh` ya lo configuran automáticamente.
-   - Para SSH manual: `ssh -p 22022 <usuario>@kabre.cenat.ac.cr`.
-
-2. **Ubicación de ejecución de los scripts**:
-   - `sync_to_kabre.sh` y `pull_results.sh` se corren en tu **máquina local** (Steam Deck / laptop).
-   - `setup_env.sh`, `run_tests.slurm` y `run_bench.slurm` se corren **dentro de Kabré**.
-
-3. **Directorio de trabajo en SLURM (`$SLURM_SUBMIT_DIR`)**:
-   - SLURM copia los scripts de lote a `/var/spool/slurmd/...` antes de lanzarlos.
-   - `run_tests.slurm` y `run_bench.slurm` usan `$SLURM_SUBMIT_DIR` para situarse siempre en la raíz real del repositorio.
-
-4. **Compatibilidad con GCC y C11**:
-   - Algunos nodos de Kabré cuentan con GCC 8, que no reconoce `-std=c2x`.
-   - El `Makefile` detecta automáticamente si el compilador soporta `c23`, `c2x` o hace fallback seguro a `c11`, garantizando compilación sin errores.
-
-5. **Compatibilidad de glibc (`posix_spawn_file_actions_addchdir_np`)**:
-   - Las versiones de Linux corporativo en clusters HPC antiguos tienen `glibc < 2.29`, que carece de esa función no-estándar.
-   - El código en `src/exec/job_execute.c` implementa el cambio de directorio de forma estándar y portable mediante shell wrapper.
-
----
-
-## Configuración recomendada de SSH (`~/.ssh/config`)
-
-Para conectarte simplemente con `ssh kabre` sin tener que escribir el puerto ni usuario cada vez, agrega esto a tu archivo local `~/.ssh/config` (fuera del repositorio, en tu `$HOME`):
+Kabré atiende SSH en el puerto **22022**. En tu `~/.ssh/config`:
 
 ```sshconfig
 Host kabre
@@ -52,52 +29,52 @@ Host kabre
     Port 22022
 ```
 
----
+`kabre.sh` usa ese alias. Sin alias: `KABRE_HOST=<usuario>@kabre.cenat.ac.cr KABRE_SSH_PORT=22022`.
+El repositorio queda en `~/message_broker_distribuido` (cambiable con `KABRE_DIR`).
 
-## Flujo de trabajo paso a paso
+## Flujo
 
-### Paso 1: Sincronizar el repositorio hacia Kabré (en tu máquina local)
 ```bash
-./scripts/kabre/sync_to_kabre.sh <tu_usuario>
+# 1. Una vez: copiar el repo, revisar módulos y compilar en el nodo de login
+scripts/kabre/kabre.sh setup
+
+# 2. Pruebas en un nodo y en varios nodos (envía, espera y muestra el final del log)
+scripts/kabre/kabre.sh tests
+scripts/kabre/kabre.sh multinode
+
+# 3. Métricas con un broker por nodo, y con todos los brokers en un solo nodo
+scripts/kabre/kabre.sh bench
+scripts/kabre/kabre.sh bench --nodes=1 --ntasks-per-node=4
+
+# O todo seguido
+scripts/kabre/kabre.sh all
 ```
 
-### Paso 2: Conectarse e inicializar el entorno (en Kabré)
-```bash
-ssh kabre
-cd ~/Servidor-de-pipelines-concurrente
-bash scripts/kabre/setup_env.sh
-```
-*(Solo se requiere ejecutar `setup_env.sh` una única vez por cuenta).*
+Los argumentos después de `tests`, `multinode` o `bench` van directo a `sbatch`
+(por ejemplo `-p <partición>` o `--nodes=4`). Los logs de cada trabajo quedan en
+`bench/results/kabre_logs/` y los CSV del benchmark en `bench/results/`; `kabre.sh bench`
+corre al final `bench/analyze.py all` y `bench/plot.py`, que comparan Kabré con los
+resultados locales que haya en la misma carpeta.
 
-### Paso 3: Ejecutar la suite de pruebas
-```bash
-sbatch scripts/kabre/run_tests.slurm
-```
-Monitorear el trabajo y revisar resultados:
-```bash
-squeue -u $USER
-cat tests_*.out
-cat tests_*.err
-```
+Sin `kabre.sh`, dentro de Kabré: `sbatch scripts/kabre/run_tests.slurm`, `squeue -u $USER`
+y `cat mb_tests_<id>.out`.
 
-### Paso 4: Ejecutar benchmarks y métricas de rendimiento (en Kabré)
-```bash
-sbatch scripts/kabre/run_bench.slurm
-```
-Revisar el avance y el informe de Amdahl:
-```bash
-squeue -u $USER
-cat bench_*.out
-```
+## Problemas conocidos y decisiones
 
-### Paso 5: Descargar los resultados y generar gráficos (en tu máquina local)
-1. Descargar los CSV generados en Kabré a tu máquina local:
-   ```bash
-   ./scripts/kabre/pull_results.sh <tu_usuario>
-   ```
-
-2. Generar todos los gráficos comparativos (Kabré vs Local vs Ideal):
-   ```bash
-   python3 bench/plot.py
-   ```
-   Los gráficos vectoriales `.svg` quedarán disponibles en `bench/results/plots/`.
+1. **`MPI_THREAD_MULTIPLE`.** El broker lo exige (un hilo recibe mientras otros envían)
+   y aborta con un mensaje claro si el MPI no lo da. `setup_env.sh` lo verifica; si un
+   módulo no lo soporta, probar otro con `MB_MODULES="gcc/<v> openmpi/<v>"`.
+2. **Estándar de C.** El `Makefile` usa `-std=c23`, o `-std=c2x`, o `-std=c11` si el gcc
+   es viejo (GCC 8 de AlmaLinux 8). `env.sh` carga el gcc más nuevo disponible para
+   compilar con las banderas oficiales; `setup_env.sh` avisa si quedó en `c11`.
+3. **Un broker por nodo.** Con Open MPI se lanza con `--map-by node` (con MPICH,
+   `-ppn 1`). Antes de arrancar, el trabajo pregunta a `mpirun` en qué nodo queda cada
+   rank, para que los clientes se conecten al puerto `base + rank` del nodo correcto.
+4. **Clientes con IPv4.** `mbcli` y `mbbench` aceptan una dirección IPv4, no un nombre;
+   los scripts traducen el nombre de cada nodo con `getent ahostsv4`.
+5. **Datos.** Las pruebas multinodo guardan los datos en el home compartido, porque la
+   prueba de consistencia lee el log de cada broker desde el nodo del lote. El benchmark
+   usa el `/tmp` local de cada nodo para medir el broker y no el NFS.
+6. **CPU del receptor MPI.** El `MPI_Probe` bloqueante de Open MPI gira dentro de su
+   motor de progreso, así que varios brokers en un nodo compiten por CPU; los scripts activan
+   `OMPI_MCA_mpi_yield_when_idle=1` para que cedan el procesador.
