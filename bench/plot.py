@@ -1,97 +1,35 @@
 #!/usr/bin/env python3
 """
-Generador de gráficos comparativos para los benchmarks del servidor de pipelines.
-Genera gráficos vectoriales SVG (sin dependencias externas) en bench/results/plots/.
+Charts of the message broker benchmarks, as SVG files with no dependencies,
+in bench/results/plots/. Every environment found is drawn in the same chart.
 
-Uso:
-    python3 bench/plot.py
+usage: python3 bench/plot.py [results.csv ...]     (default: bench/results/bench_*.csv)
+
+  <scenario>_speedup.svg      S(p) per environment, the ideal S(p) = p and Amdahl's fit
+  <scenario>_efficiency.svg   E(p) per environment        (brokers, partitions, consumers)
+  <scenario>_latency.svg      median and p99 latency of the produce round trip
+  hot_throughput.svg          msg/s against the share of messages with the hot key
+  replication_throughput.svg  msg/s against acks, one line per R and environment
+  replication_latency.svg     p99 against acks, one line per R and environment
 """
-import glob
-import math
 import os
 import sys
-from collections import defaultdict
 
-SCENARIOS = {
-    "wide": "Escenario Wide (16 tareas independientes, varía agentes)",
-    "deep": "Escenario Deep (16 tareas encadenadas por dependencias)",
-    "data_wc": "Escenario WordCount (Data task, varía OpenMP threads)",
-    "data_hist": "Escenario Histogram (Data task, varía OpenMP threads)",
-    "combined": "Escenario Combined (3 pipelines compitiendo por agentes)",
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import analyze  # noqa: E402
+
+PALETTE = ["#2563eb", "#ea580c", "#10b981", "#9333ea", "#dc2626", "#0891b2"]
+IDEAL = "#9ca3af"
+
+X_TITLES = {
+    "brokers": "Brokers (and partitions)",
+    "partitions": "Partitions (3 brokers)",
+    "consumers": "Members of the group",
 }
-
-COLORS = {
-    "kabre": "#2563eb",  # Azul fuerte
-    "local": "#ea580c",  # Naranja
-    "ideal": "#9ca3af",  # Gris punteado (ideal)
-    "amdahl": "#10b981", # Verde
-}
-
-
-def load_csv(path):
-    data = defaultdict(lambda: defaultdict(list))
-    meta = {}
-    with open(path, newline="", encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if line.startswith("#"):
-                clean = line.lstrip("# ").strip()
-                if ":" in clean:
-                    k, v = clean.split(":", 1)
-                    meta[k.strip().lower()] = v.strip()
-                continue
-            parts = line.split(",")
-            if len(parts) == 4:
-                scen, param, run, sec = parts
-                try:
-                    data[scen][int(param)].append(float(sec))
-                except ValueError:
-                    continue
-
-    medians = defaultdict(dict)
-    for sc, by_param in data.items():
-        for param, vals in by_param.items():
-            vals.sort()
-            n = len(vals)
-            med = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2.0
-            medians[sc][param] = med
-
-    raw_host = meta.get("host", os.path.basename(path).split("_")[0]).split("|")[0].strip()
-    if "kura" in raw_host or "kabre" in raw_host or "cnca" in raw_host:
-        label = "Kabré"
-    else:
-        label = "Local"
-
-    cpu = meta.get("cpu", "CPU").split("|")[0].strip()
-    return {
-        "path": path,
-        "label": label,
-        "cpu": cpu,
-        "meta": meta,
-        "medians": medians,
-    }
-
-
-def compute_metrics(env_data):
-    """Calcula Speedup S(p) y Eficiencia E(p) respecto a p=1 para cada escenario."""
-    metrics = defaultdict(dict)
-    for scen, points in env_data["medians"].items():
-        t1 = points.get(1)
-        if not t1:
-            continue
-        for p, tp in sorted(points.items()):
-            sp = t1 / tp if tp > 0 else 0
-            ep = sp / p if p > 0 else 0
-            metrics[scen][p] = {
-                "t": tp,
-                "sp": sp,
-                "ep": ep,
-            }
-    return metrics
 
 
 def generate_svg_line_chart(title, x_label, y_label, series_dict, x_vals, y_max=None, is_efficiency=False):
-    """Genera un archivo SVG con un gráfico de líneas limpio, estilizado y legible."""
+    """SVG line chart; series_dict maps a name to {"color", "data": {x: y}, "dashed"}."""
     width, height = 700, 420
     margin_l, margin_r, margin_t, margin_b = 80, 140, 60, 60
     plot_w = width - margin_l - margin_r
@@ -118,11 +56,11 @@ def generate_svg_line_chart(title, x_label, y_label, series_dict, x_vals, y_max=
     svg.append(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
                f'style="background-color: #ffffff; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif;">')
 
-    # Fondo y grid
+    # Background and grid
     svg.append(f'  <rect width="{width}" height="{height}" fill="#ffffff" rx="8"/>')
     svg.append(f'  <text x="{width / 2}" y="32" text-anchor="middle" font-size="16" font-weight="bold" fill="#1f2937">{title}</text>')
 
-    # Grid horizontal
+    # Horizontal grid
     n_ticks = 5
     for i in range(n_ticks + 1):
         y_val = y_min + (y_max - y_min) * (i / n_ticks)
@@ -131,26 +69,26 @@ def generate_svg_line_chart(title, x_label, y_label, series_dict, x_vals, y_max=
         val_str = f"{y_val:.2f}" if y_max < 5 else f"{y_val:.1f}"
         svg.append(f'  <text x="{margin_l - 12}" y="{y_pos + 4:.1f}" text-anchor="end" font-size="11" fill="#6b7280">{val_str}</text>')
 
-    # Grid vertical y etiquetas eje X
+    # Vertical grid and X-axis labels
     for p in x_vals:
         x_pos = get_x(p)
         svg.append(f'  <line x1="{x_pos:.1f}" y1="{margin_t}" x2="{x_pos:.1f}" y2="{margin_t + plot_h}" stroke="#f3f4f6" stroke-width="1"/>')
         svg.append(f'  <text x="{x_pos:.1f}" y="{margin_t + plot_h + 20}" text-anchor="middle" font-size="12" font-weight="500" fill="#374151">{p}</text>')
 
-    # Títulos de ejes
+    # Axis titles
     svg.append(f'  <text x="{margin_l + plot_w / 2}" y="{height - 15}" text-anchor="middle" font-size="12" fill="#4b5563">{x_label}</text>')
     svg.append(f'  <text x="25" y="{margin_t + plot_h / 2}" text-anchor="middle" transform="rotate(-90 25 {margin_t + plot_h / 2})" font-size="12" fill="#4b5563">{y_label}</text>')
 
-    # Ejes principales
+    # Main axes
     svg.append(f'  <line x1="{margin_l}" y1="{margin_t}" x2="{margin_l}" y2="{margin_t + plot_h}" stroke="#9ca3af" stroke-width="1.5"/>')
     svg.append(f'  <line x1="{margin_l}" y1="{margin_t + plot_h}" x2="{margin_l + plot_w}" y2="{margin_t + plot_h}" stroke="#9ca3af" stroke-width="1.5"/>')
 
-    # Línea ideal para speedup o eficiencia si corresponde
+    # Ideal line for speedup or efficiency, when applicable
     if is_efficiency:
         y_ideal = get_y(1.0)
         svg.append(f'  <line x1="{margin_l}" y1="{y_ideal:.1f}" x2="{margin_l + plot_w}" y2="{y_ideal:.1f}" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="4,4"/>')
 
-    # Dibujar cada serie
+    # Draw each series
     legend_y = margin_t + 10
     for name, s in series_dict.items():
         color = s["color"]
@@ -168,7 +106,7 @@ def generate_svg_line_chart(title, x_label, y_label, series_dict, x_vals, y_max=
         for pt in points:
             svg.append(f'  <circle cx="{pt[0]:.1f}" cy="{pt[1]:.1f}" r="4.5" fill="{color}" stroke="#ffffff" stroke-width="1.5"/>')
 
-        # Leyenda
+        # Legend
         svg.append(f'  <line x1="{margin_l + plot_w + 15}" y1="{legend_y}" x2="{margin_l + plot_w + 35}" y2="{legend_y}" stroke="{color}" stroke-width="2.5"/>')
         svg.append(f'  <circle cx="{margin_l + plot_w + 25}" cy="{legend_y}" r="3.5" fill="{color}"/>')
         svg.append(f'  <text x="{margin_l + plot_w + 42}" y="{legend_y + 4}" font-size="11" fill="#374151">{name}</text>')
@@ -178,105 +116,102 @@ def generate_svg_line_chart(title, x_label, y_label, series_dict, x_vals, y_max=
     return "\n".join(svg)
 
 
-def main():
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    results_dir = os.path.join(root, "bench", "results")
-    plots_dir = os.path.join(results_dir, "plots")
-    os.makedirs(plots_dir, exist_ok=True)
+def by_env(points, scenario):
+    """environment label -> points of that scenario"""
+    out = {}
+    for (env, nodes, scen), pts in sorted(points.items()):
+        if scen == scenario:
+            out[f"{env} ({nodes}n)"] = pts
+    return out
 
-    csv_files = glob.glob(os.path.join(results_dir, "*.csv"))
-    if not csv_files:
-        print("No se encontraron archivos CSV en bench/results/")
-        sys.exit(1)
 
-    print(f"[+] Archivos CSV detectados ({len(csv_files)}):")
-    envs = []
-    for f in sorted(csv_files):
-        env = load_csv(f)
-        env["metrics"] = compute_metrics(env)
-        envs.append(env)
-        print(f"    - {env['label']} ({env['cpu']}) -> {os.path.basename(f)}")
+def write(plots_dir, name, svg):
+    path = os.path.join(plots_dir, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(svg)
+    print(f"    {path}")
 
-    for scen, desc in SCENARIOS.items():
-        # Obtener lista unificada de x_vals (p.ej. 1, 2, 4, 8)
-        all_p = set()
-        for env in envs:
-            all_p.update(env["metrics"].get(scen, {}).keys())
-        if not all_p:
+
+def number(text):
+    value = float(text)
+    return int(value) if value.is_integer() else value
+
+
+def speedup_charts(points, plots_dir):
+    for scenario in analyze.SPEEDUP_SCENARIOS:
+        envs = by_env(points, scenario)
+        if not envs:
             continue
-        x_vals = sorted(all_p)
+        x_vals = sorted({number(pt["param"]) for pts in envs.values() for pt in pts})
+        speedup, efficiency, latency = {}, {}, {}
+        for i, (label, pts) in enumerate(envs.items()):
+            color = PALETTE[i % len(PALETTE)]
+            speedup[label] = {"color": color, "data": {number(pt["param"]): pt["speedup"] for pt in pts}}
+            speedup[f"{label} Amdahl f={pts[0]['amdahl_f']:.2f}"] = {
+                "color": color, "dashed": True,
+                "data": {number(pt["param"]): pt["amdahl_s"] for pt in pts}}
+            efficiency[label] = {"color": color, "data": {number(pt["param"]): pt["efficiency"] for pt in pts}}
+            latency[f"{label} p50"] = {"color": color, "data": {number(pt["param"]): pt["p50"] for pt in pts}}
+            latency[f"{label} p99"] = {"color": color, "dashed": True,
+                                       "data": {number(pt["param"]): pt["p99"] for pt in pts}}
+        p0 = x_vals[0]
+        speedup["Ideal S(p) = p"] = {"color": IDEAL, "dashed": True, "data": {p: p / p0 for p in x_vals}}
+        x_title = X_TITLES[scenario]
+        write(plots_dir, f"{scenario}_speedup.svg", generate_svg_line_chart(
+            f"Speedup S(p) - {scenario}", x_title, "S(p) by throughput", speedup, x_vals))
+        write(plots_dir, f"{scenario}_efficiency.svg", generate_svg_line_chart(
+            f"Efficiency E(p) - {scenario}", x_title, "E(p)", efficiency, x_vals, y_max=1.1, is_efficiency=True))
+        if scenario != "consumers":
+            write(plots_dir, f"{scenario}_latency.svg", generate_svg_line_chart(
+                f"Produce latency - {scenario}", x_title, "ms (median of runs)", latency, x_vals))
 
-        x_title = "Número de hilos OpenMP" if "data" in scen else "Número de agentes"
 
-        # 1. Gráfico de Speedup S(p)
-        speedup_series = {}
-        for idx, env in enumerate(envs):
-            lbl = env["label"].lower()
-            c = COLORS["kabre"] if ("kura" in lbl or "kabr" in lbl) else COLORS["local"]
-            data_sp = {p: env["metrics"][scen][p]["sp"] for p in x_vals if p in env["metrics"].get(scen, {})}
-            speedup_series[env["label"]] = {"color": c, "data": data_sp}
+def hot_chart(points, plots_dir):
+    envs = by_env(points, "hot")
+    if not envs:
+        return
+    x_vals = sorted({number(pt["param"]) for pts in envs.values() for pt in pts})
+    series = {label: {"color": PALETTE[i % len(PALETTE)],
+                      "data": {number(pt["param"]): pt["throughput"] for pt in pts}}
+              for i, (label, pts) in enumerate(envs.items())}
+    write(plots_dir, "hot_throughput.svg", generate_svg_line_chart(
+        "Hot key - throughput", "% of messages with the same key", "msg/s", series, x_vals))
 
-        # Serie ideal lineal S(p) = p
-        speedup_series["Ideal (Lineal)"] = {
-            "color": COLORS["ideal"],
-            "data": {p: float(p) for p in x_vals},
-            "dashed": True
-        }
 
-        sp_svg = generate_svg_line_chart(
-            f"Speedup S(p) - {scen.upper()}",
-            x_title,
-            "Speedup S(p)",
-            speedup_series,
-            x_vals
-        )
-        sp_file = f"{scen}_speedup.svg"
-        with open(os.path.join(plots_dir, sp_file), "w", encoding="utf-8") as f:
-            f.write(sp_svg)
+def replication_charts(points, plots_dir):
+    envs = by_env(points, "replication")
+    if not envs:
+        return
+    x_vals = ["0", "1", "ALL"]
+    throughput, latency = {}, {}
+    i = 0
+    for label, pts in envs.items():
+        for r in sorted({pt["replication"] for pt in pts}):
+            color = PALETTE[i % len(PALETTE)]
+            i += 1
+            line = {pt["acks"]: pt for pt in pts if pt["replication"] == r}
+            throughput[f"{label} R={r}"] = {"color": color, "data": {a: p["throughput"] for a, p in line.items()}}
+            latency[f"{label} R={r}"] = {"color": color, "data": {a: p["p99"] for a, p in line.items()}}
+    write(plots_dir, "replication_throughput.svg", generate_svg_line_chart(
+        "Replication cost - throughput", "acks", "msg/s", throughput, x_vals))
+    write(plots_dir, "replication_latency.svg", generate_svg_line_chart(
+        "Replication cost - p99 latency", "acks", "ms", latency, x_vals))
 
-        # 2. Gráfico de Eficiencia E(p)
-        eff_series = {}
-        for idx, env in enumerate(envs):
-            lbl = env["label"].lower()
-            c = COLORS["kabre"] if ("kura" in lbl or "kabr" in lbl) else COLORS["local"]
-            data_ep = {p: env["metrics"][scen][p]["ep"] for p in x_vals if p in env["metrics"].get(scen, {})}
-            eff_series[env["label"]] = {"color": c, "data": data_ep}
 
-        eff_svg = generate_svg_line_chart(
-            f"Eficiencia E(p) - {scen.upper()}",
-            x_title,
-            "Eficiencia E(p)",
-            eff_series,
-            x_vals,
-            y_max=1.1,
-            is_efficiency=True
-        )
-        eff_file = f"{scen}_efficiency.svg"
-        with open(os.path.join(plots_dir, eff_file), "w", encoding="utf-8") as f:
-            f.write(eff_svg)
-
-        # 3. Gráfico de Tiempo de Ejecución T(p)
-        time_series = {}
-        for idx, env in enumerate(envs):
-            lbl = env["label"].lower()
-            c = COLORS["kabre"] if ("kura" in lbl or "kabr" in lbl) else COLORS["local"]
-            data_tp = {p: env["metrics"][scen][p]["t"] for p in x_vals if p in env["metrics"].get(scen, {})}
-            time_series[env["label"]] = {"color": c, "data": data_tp}
-
-        time_svg = generate_svg_line_chart(
-            f"Tiempo T(p) [segundos] - {scen.upper()}",
-            x_title,
-            "Tiempo de ejecución (s)",
-            time_series,
-            x_vals
-        )
-        time_file = f"{scen}_time.svg"
-        with open(os.path.join(plots_dir, time_file), "w", encoding="utf-8") as f:
-            f.write(time_svg)
-
-    print(f"\n[✓] Gráficos vectoriales SVG generados exitosamente en:")
-    print(f"    {plots_dir}/")
+def main(argv):
+    paths = analyze.result_files(argv[1:])
+    if not paths:
+        print("no results: run bench/run.sh first", file=sys.stderr)
+        return 1
+    points = analyze.load_points(paths)
+    plots_dir = os.path.join(analyze.ROOT, "bench", "results", "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    print(f"charts from {len(paths)} result file(s):")
+    speedup_charts(points, plots_dir)
+    hot_chart(points, plots_dir)
+    replication_charts(points, plots_dir)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv))
