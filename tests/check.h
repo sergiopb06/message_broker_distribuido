@@ -2,11 +2,11 @@
 #define CHECK_H
 
 /*
- * Framework mínimo de reporting compartido por todas las suites de pruebas.
+ * Minimal reporting framework shared by every test suite.
  *
- * Objetivo: que la salida se autoexplique. Cada sección declara QUÉ verifica
- * y en el pie de página se declara QUÉ suite es, cuántos checks pasaron y si
- * hubo fallos. El exit code queda listo para make / CI.
+ * Goal: output that explains itself. Each section states WHAT it checks, and
+ * the footer states WHICH suite ran, how many checks passed and whether any
+ * failed. The exit code is ready for make / CI.
  */
 
 #include <stdio.h>
@@ -25,8 +25,8 @@ static int g_failures = 0;
         }                                                                         \
     } while (0)
 
-/* Encabezado de sección: qué se prueba ahora y por qué importa.
- * __attribute__((unused)) evita ruido en suites con pocas secciones. */
+/* Section header: what is being tested now and why it matters.
+ * __attribute__((unused)) avoids warnings in suites with few sections. */
 static void check_section(const char *title, const char *explains)
     __attribute__((unused));
 static void check_section(const char *title, const char *explains)
@@ -34,7 +34,7 @@ static void check_section(const char *title, const char *explains)
     printf("\n── %s · %s\n", title, explains);
 }
 
-/* Encabezado de la suite: primero, para que se sepa qué se está mirando. */
+/* Suite header: printed first, so it is clear what is being looked at. */
 static void check_header(const char *suite, const char *explains)
     __attribute__((unused));
 static void check_header(const char *suite, const char *explains)
@@ -42,7 +42,7 @@ static void check_header(const char *suite, const char *explains)
     printf("═══ %s · %s\n", suite, explains);
 }
 
-/* Pie de página: resultado legible + exit code correcto. */
+/* Footer: readable result + correct exit code. */
 static int check_summary(const char *suite)
     __attribute__((unused));
 static int check_summary(const char *suite)

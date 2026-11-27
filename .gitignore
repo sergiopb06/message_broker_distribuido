@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Project build output and runtime data
+bin/
+build/
+data/
+.cluster_data_*/
+*.err
+bench/results/kabre_logs/
+__pycache__/
