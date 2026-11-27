@@ -1,4 +1,6 @@
 CC      = mpicc
+MPIRUN      ?= mpirun
+MPIRUN_ARGS ?=
 STD    ?= $(shell $(CC) -std=c23 -E -x c /dev/null >/dev/null 2>&1 && echo c23 || ($(CC) -std=c2x -E -x c /dev/null >/dev/null 2>&1 && echo c2x || echo c11))
 CFLAGS  = -std=$(STD) -Wall -Wextra -pedantic -O2 -pthread -Iinclude
 BUILD   = build
@@ -14,7 +16,8 @@ OBJS_NET     = $(BUILD)/net_util.o $(BUILD)/protocol.o
 OBJS_CLIENT  = $(BUILD)/client.o $(OBJS_NET)
 
 TESTS    = $(BIN)/test_log $(BIN)/test_log_recovery $(BIN)/test_log_retention \
-           $(BIN)/test_metadata $(BIN)/test_race_log
+           $(BIN)/test_metadata $(BIN)/test_race_log $(BIN)/test_replica_reset \
+           $(BIN)/test_mpi_layer $(BIN)/mb_logdump
 
 ALL_BINS = $(BIN)/brokerd $(BIN)/mbcli $(BIN)/mbbench $(TESTS)
 
@@ -44,13 +47,40 @@ $(BIN)/test_metadata: $(BUILD)/test_metadata.o $(BUILD)/metadata.o $(OBJS_STORAG
 $(BIN)/test_race_log: $(BUILD)/test_race_log.o $(OBJS_STORAGE) | $(BIN)
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(BIN)/test_replica_reset: $(BUILD)/test_replica_reset.o $(OBJS_STORAGE) | $(BIN)
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BIN)/test_mpi_layer: $(BUILD)/test_mpi_layer.o $(BUILD)/mpi_layer.o | $(BIN)
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BIN)/mb_logdump: $(BUILD)/mb_logdump.o $(OBJS_STORAGE) | $(BIN)
+	$(CC) $(CFLAGS) -o $@ $^
+
+# make test: unit tests, then the MPI layer, the clients and the cluster under $(MPIRUN).
+# On a machine with fewer than 3 cores: make test MPIRUN_ARGS=--oversubscribe
 test: all
 	@echo "═══ TEST SUITE"
 	@echo ""
 	@$(BIN)/test_log && $(BIN)/test_log_recovery && $(BIN)/test_log_retention && \
-	$(BIN)/test_metadata && $(BIN)/test_race_log
+	$(BIN)/test_metadata && $(BIN)/test_race_log && $(BIN)/test_replica_reset
+	@echo ""
+	@$(MAKE) --no-print-directory test-mpi
+	@echo ""
+	@$(MAKE) --no-print-directory test-integration
+	@echo ""
+	@$(MAKE) --no-print-directory test-cluster
 	@echo ""
 	@echo "═══ SUITE COMPLETE — any ✘ marks the exit code"
+
+test-mpi: $(BIN)/test_mpi_layer
+	@echo "═══ test_mpi_layer · capa MPI con mensajes de juguete (3 procesos)"
+	$(MPIRUN) $(MPIRUN_ARGS) -np 3 $(BIN)/test_mpi_layer
+
+test-integration: $(BIN)/brokerd $(BIN)/mbcli
+	MPIRUN="$(MPIRUN)" MPIRUN_ARGS="$(MPIRUN_ARGS)" bash tests/test_integration.sh
+
+test-cluster: $(BIN)/brokerd $(BIN)/mbcli $(BIN)/mb_logdump
+	MPIRUN="$(MPIRUN)" MPIRUN_ARGS="$(MPIRUN_ARGS)" bash tests/test_cluster.sh
 
 
 
@@ -78,7 +108,7 @@ $(BUILD) $(BIN):
 clean:
 	rm -rf $(BUILD) $(BIN)
 
-.PHONY: all test clean test-race
+.PHONY: all test clean test-race test-mpi test-integration test-cluster
 
 
 test-race:
