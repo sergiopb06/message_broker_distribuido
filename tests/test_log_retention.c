@@ -156,6 +156,25 @@ static void test_basic(void)
     rm_rf(dir);
 }
 
+// The broker opens its logs with plog_open, which sizes the segments from the
+// limit: a realistic retention.bytes must drop data without an explicit size.
+static void test_broker_segments(void)
+{
+    check_section("broker segments", "plog_open sizes segments from retention.bytes, so a 64 KiB limit drops data");
+    char dir[64];
+    make_tmpdir(dir, sizeof dir);
+    const long limit = 64 * 1024;
+    partition_log_t *log = plog_open(dir, (uint64_t)limit);
+    CHECK(log != NULL);
+    CHECK(append_many(log, 0, 5000, true) == 0);
+    CHECK(plog_start_offset(log) > 0);
+    CHECK(plog_end_offset(log) == 5000);
+    CHECK(disk_bytes(dir) <= limit);
+    CHECK(verify_from_start(log));
+    plog_close(log);
+    rm_rf(dir);
+}
+
 static void test_respects_hwm(void)
 {
     check_section("high watermark", "nothing at or above the high watermark is dropped");
@@ -384,6 +403,7 @@ int main(void)
 {
     check_header("test_log_retention", "partition log: retention.bytes with concurrent readers");
     test_basic();
+    test_broker_segments();
     test_respects_hwm();
     test_unlimited();
     test_reopen();
