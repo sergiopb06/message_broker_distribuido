@@ -60,7 +60,9 @@ int nu_write_all(int file_descriptor, const void* buffer, size_t size)
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            perror("write");
+            // A peer that went away is normal for a broker: only report the rest
+            if (errno != EPIPE && errno != ECONNRESET)
+                perror("send");
             return -1;
         }
         sent += (size_t)n;
