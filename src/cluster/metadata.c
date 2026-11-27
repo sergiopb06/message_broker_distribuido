@@ -521,18 +521,21 @@ partition_log_t *meta_get_log(const char *topic, int partition)
     return log;
 }
 
-int meta_list(char *out, size_t size)
+static int meta_list_build(char **out, size_t *len)
 {
-    if (out == NULL || size == 0) {
+    if (out == NULL || len == NULL) {
         return -1;
     }
+    *out = NULL;
+    *len = 0;
+
     char *text = NULL;
-    size_t len = 0;
+    size_t text_len = 0;
     pthread_mutex_lock(&g_meta.mutex);
     int rc = -1;
     FILE *f = NULL;
     if (g_meta.ready) {
-        f = open_memstream(&text, &len);
+        f = open_memstream(&text, &text_len);
     }
     if (f != NULL) {
         for (size_t i = 0; i < g_meta.table.count; i++) {
@@ -545,11 +548,34 @@ int meta_list(char *out, size_t size)
         }
     }
     pthread_mutex_unlock(&g_meta.mutex);
-    if (rc == MB_OK) {
+
+    if (rc == MB_OK && text != NULL) {
+        *out = text;
+        *len = text_len;
+    } else {
+        free(text);
+    }
+    return rc;
+}
+
+int meta_list(char *out, size_t size)
+{
+    if (out == NULL || size == 0) {
+        return -1;
+    }
+    char *text = NULL;
+    size_t len = 0;
+    int rc = meta_list_build(&text, &len);
+    if (rc == MB_OK && text != NULL) {
         snprintf(out, size, "%s", text);
     }
     free(text);
     return rc;
+}
+
+int meta_list_alloc(char **out, size_t *len)
+{
+    return meta_list_build(out, len);
 }
 
 int meta_describe(const char *topic, char *out, size_t size)
@@ -607,14 +633,33 @@ int meta_describe(const char *topic, char *out, size_t size)
         int n_isr = 0;
         int64_t hwm = -1;
         int64_t leo = -1;
+        bool have_state = false;
+        bool have_isr = false;
+
         if (repl_partition_state != NULL
             && repl_partition_state(name, p, isr, &n_isr, &hwm, &leo) == MB_OK) {
-            fprintf(f, " isr=");
-            for (int k = 0; k < n_isr; k++) {
-                if (k > 0) {
-                    fputc(',', f);
+            have_state = true;
+            have_isr = true;
+        } else {
+            // No replication module linked (for example the storage unit tests)
+            // or the leader did not answer: show what this broker keeps locally.
+            partition_log_t *log = meta_get_log(name, p);
+            if (log != NULL) {
+                hwm = plog_hwm(log);
+                leo = plog_end_offset(log);
+                have_state = true;
+            }
+        }
+
+        if (have_state) {
+            if (have_isr) {
+                fprintf(f, " isr=");
+                for (int k = 0; k < n_isr; k++) {
+                    if (k > 0) {
+                        fputc(',', f);
+                    }
+                    fprintf(f, "%d", isr[k]);
                 }
-                fprintf(f, "%d", isr[k]);
             }
             fprintf(f, " hwm=%lld leo=%lld", (long long)hwm, (long long)leo);
         }

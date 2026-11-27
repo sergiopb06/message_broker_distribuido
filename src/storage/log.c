@@ -895,6 +895,49 @@ void plog_set_hwm(partition_log_t *log, int64_t hwm)
     pthread_mutex_unlock(&log->mutex);
 }
 
+int plog_reset_replica(partition_log_t *log, int64_t next_offset)
+{
+    if (log == NULL || next_offset < 0) {
+        return MB_ERR_INVALID_ARGUMENT;
+    }
+
+    pthread_mutex_lock(&log->mutex);
+    if (log->closed) {
+        pthread_mutex_unlock(&log->mutex);
+        return MB_ERR_SHUTTING_DOWN;
+    }
+    // Moving backwards would reuse offsets, which the log contract forbids.
+    if (next_offset < log->leo) {
+        pthread_mutex_unlock(&log->mutex);
+        return MB_ERR_INVALID_ARGUMENT;
+    }
+
+    // The data below next_offset was dropped by the leader's retention policy;
+    // a replica has no consumer-visible state of its own (no leader election),
+    // so the safe recovery is to start a fresh segment at next_offset.
+    for (size_t i = 0; i < log->nsegs; i++) {
+        char path[PATH_MAX + 32];
+        int len = snprintf(path, sizeof path, "%s/%020lld.log", log->dir,
+                           (long long)log->segs[i].base_offset);
+        if (len >= 0 && (size_t)len < sizeof path) {
+            (void)unlink(path);
+        }
+        close(log->segs[i].fd);
+        free(log->segs[i].pos);
+    }
+    log->nsegs = 0;
+    log->leo = next_offset;
+    log->hwm = next_offset;
+
+    int rc = segment_add_locked(log, next_offset, false);
+    if (rc == 0 && hwm_save(log->dir, next_offset) != 0) {
+        rc = -1;
+    }
+    pthread_cond_broadcast(&log->changed);
+    pthread_mutex_unlock(&log->mutex);
+    return (rc == 0) ? MB_OK : -1;
+}
+
 int plog_flush(partition_log_t *log)
 {
     pthread_mutex_lock(&log->mutex);

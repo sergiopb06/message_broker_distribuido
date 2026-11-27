@@ -41,6 +41,9 @@ partition_log_t *meta_get_log(const char *topic, int partition);
 
 int meta_list(char *out, size_t size);
 
+// Same text as meta_list, but grows as needed: free() the result.
+int meta_list_alloc(char **out, size_t *len);
+
 int meta_describe(const char *topic, char *out, size_t size);
 
 int meta_get_snapshot(char **out, size_t *len);

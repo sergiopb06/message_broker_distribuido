@@ -37,6 +37,12 @@ int64_t plog_end_offset(partition_log_t *log);
 int64_t plog_hwm(partition_log_t *log);
 void plog_set_hwm(partition_log_t *log, int64_t hwm);
 
+// Replica recovery after the leader already applied retention to offsets this
+// replica still needed. Discards every local record and restarts the log at
+// next_offset (the leader's first available offset). Offsets are never reused:
+// next_offset must be >= the current end offset.
+int plog_reset_replica(partition_log_t *log, int64_t next_offset);
+
 int plog_flush(partition_log_t *log);
 
 // Wakes every waiter and frees the log once no thread is using it.
